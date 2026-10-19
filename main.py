@@ -1,33 +1,123 @@
 import tkinter as tk
-from tkinter import messagebox, filedialog
+from tkinter import messagebox
 import subprocess
 import os
 import sys
 import textwrap
 from pathlib import Path
+from PIL import Image, ImageDraw, ImageFont
 
 APP_NAME = "НЕЙРОХАК СТУДИЯ"
 WIDTH = 720
 HEIGHT = 1280
 
 def app_dir():
-    return Path(sys.executable).parent if getattr(
-        sys, "frozen", False
-    ) else Path(__file__).parent
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
 
 BASE = app_dir()
 OUTPUT = BASE / "output"
 OUTPUT.mkdir(exist_ok=True)
 
 
+def create_background(title, script):
+    img = Image.new(
+        "RGB",
+        (WIDTH, HEIGHT),
+        "#080B16"
+    )
+
+    draw = ImageDraw.Draw(img)
+
+    font_path = "C:/Windows/Fonts/arial.ttf"
+
+    title_font = ImageFont.truetype(
+        font_path, 48
+    )
+
+    text_font = ImageFont.truetype(
+        font_path, 34
+    )
+
+    small_font = ImageFont.truetype(
+        font_path, 26
+    )
+
+    # Неоновая рамка
+    draw.rounded_rectangle(
+        (35, 180, 685, 1100),
+        radius=30,
+        outline="#00D9FF",
+        width=5
+    )
+
+    # Название бренда
+    draw.text(
+        (WIDTH // 2, 80),
+        "НЕЙРОХАК",
+        font=title_font,
+        fill="#00D9FF",
+        anchor="mm"
+    )
+
+    # Заголовок ролика
+    wrapped_title = textwrap.fill(
+        title[:80],
+        width=22
+    )
+
+    draw.multiline_text(
+        (WIDTH // 2, 260),
+        wrapped_title,
+        font=title_font,
+        fill="white",
+        anchor="ma",
+        align="center",
+        spacing=12
+    )
+
+    # Основной текст
+    wrapped_script = textwrap.fill(
+        script[:450],
+        width=34
+    )
+
+    draw.multiline_text(
+        (WIDTH // 2, 500),
+        wrapped_script,
+        font=text_font,
+        fill="white",
+        anchor="ma",
+        align="center",
+        spacing=14
+    )
+
+    # Нижняя надпись
+    draw.text(
+        (WIDTH // 2, 1180),
+        "VK • НЕЙРОХАК",
+        font=small_font,
+        fill="#8B5CF6",
+        anchor="mm"
+    )
+
+    background = BASE / "background.png"
+    img.save(background)
+
+    return background
+
+
 def create_video():
     title = title_entry.get().strip()
-    script = script_text.get("1.0", tk.END).strip()
+    script = script_text.get(
+        "1.0", tk.END
+    ).strip()
 
     if not title or not script:
         messagebox.showwarning(
             "Ошибка",
-            "Введите название и текст сценария."
+            "Введите название и сценарий."
         )
         return
 
@@ -40,50 +130,26 @@ def create_video():
         )
         return
 
-    output_file = OUTPUT / "neurohack_video.mp4"
-
-    # Создаём текстовый файл для FFmpeg
-    text_file = BASE / "video_text.txt"
-
-    wrapped = "\n".join(
-        textwrap.wrap(script[:350], width=28)
-    )
-
-    text_file.write_text(
-        wrapped,
-        encoding="utf-8"
-    )
-
-    font = "C:/Windows/Fonts/arial.ttf"
-
-    # Подготавливаем путь для фильтра FFmpeg
-    text_path = str(text_file).replace("\\", "/")
-    text_path = text_path.replace(":", "\\:")
-
-    filter_complex = (
-        f"drawtext=fontfile='{font}':"
-        f"textfile='{text_path}':"
-        "fontcolor=white:"
-        "fontsize=32:"
-        "line_spacing=12:"
-        "x=(w-text_w)/2:"
-        "y=(h-text_h)/2"
-    )
-
-    command = [
-        str(ffmpeg),
-        "-y",
-        "-f", "lavfi",
-        "-i", f"color=c=0x080B16:s={WIDTH}x{HEIGHT}:r=25",
-        "-t", "15",
-        "-vf", filter_complex,
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-pix_fmt", "yuv420p",
-        str(output_file)
-    ]
-
     try:
+        background = create_background(
+            title, script
+        )
+
+        output_file = OUTPUT / "neurohack_video.mp4"
+
+        command = [
+            str(ffmpeg),
+            "-y",
+            "-loop", "1",
+            "-framerate", "25",
+            "-i", str(background),
+            "-t", "15",
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-pix_fmt", "yuv420p",
+            str(output_file)
+        ]
+
         subprocess.run(
             command,
             check=True,
@@ -94,13 +160,13 @@ def create_video():
 
         messagebox.showinfo(
             "Готово!",
-            f"Видео сохранено:\n{output_file}"
+            f"Видео создано:\n{output_file}"
         )
 
-    except subprocess.CalledProcessError as e:
+    except Exception as e:
         messagebox.showerror(
-            "Ошибка FFmpeg",
-            e.stderr[-1500:]
+            "Ошибка",
+            str(e)
         )
 
 

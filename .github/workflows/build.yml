@@ -37,11 +37,12 @@ jobs:
 
           Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_files
 
-          $ffmpeg = Get-ChildItem ffmpeg_files -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          $ffmpeg = Get-ChildItem ffmpeg_files -Recurse -Filter ffmpeg.exe |
+            Select-Object -First 1
 
           Copy-Item $ffmpeg.FullName dist/NeuroHackStudio/ffmpeg.exe
 
-           - name: Download Piper
+      - name: Download Piper
         shell: pwsh
         run: |
           Invoke-WebRequest `
@@ -60,11 +61,6 @@ jobs:
           if (!(Test-Path "dist/NeuroHackStudio/espeak-ng-data")) {
             throw "Папка espeak-ng-data не найдена!"
           }
-
-          Expand-Archive piper.zip -DestinationPath piper_files
-
-          Get-ChildItem piper_files -Recurse -File |
-            Copy-Item -Destination dist/NeuroHackStudio/ -Force
 
       - name: Download voices
         shell: pwsh

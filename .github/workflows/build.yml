@@ -41,12 +41,25 @@ jobs:
 
           Copy-Item $ffmpeg.FullName dist/NeuroHackStudio/ffmpeg.exe
 
-      - name: Download Piper
+           - name: Download Piper
         shell: pwsh
         run: |
           Invoke-WebRequest `
             -Uri "https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_windows_amd64.zip" `
             -OutFile "piper.zip"
+
+          Expand-Archive piper.zip -DestinationPath piper_files
+
+          $piperDir = Get-ChildItem piper_files -Recurse -Filter piper.exe |
+            Select-Object -First 1 -ExpandProperty DirectoryName
+
+          Copy-Item "$piperDir\*" `
+            -Destination "dist/NeuroHackStudio/" `
+            -Recurse -Force
+
+          if (!(Test-Path "dist/NeuroHackStudio/espeak-ng-data")) {
+            throw "Папка espeak-ng-data не найдена!"
+          }
 
           Expand-Archive piper.zip -DestinationPath piper_files
 

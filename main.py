@@ -208,11 +208,37 @@ def generate_audio(text, voice_name, output_file):
             f"Не найдена голосовая модель:\n{model}"
         )
 
-    run_command([
+        espeak_path = BASE / "espeak-ng-data"
+
+    if not espeak_path.exists():
+        raise RuntimeError(
+            "Не найдена папка espeak-ng-data. "
+            "Проверь комплектацию Piper."
+        )
+
+    command = [
         str(piper),
         "--model", str(model),
         "--output_file", str(output_file)
-    ], input_text=text)
+    ]
+
+    result = subprocess.run(
+        command,
+        input=text,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        cwd=str(BASE),
+        env={
+            **os.environ,
+            "ESPEAK_DATA_PATH": str(espeak_path)
+        },
+        creationflags=subprocess.CREATE_NO_WINDOW
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr[-2000:])
 
 
 def create_scene_video(image, audio, output):

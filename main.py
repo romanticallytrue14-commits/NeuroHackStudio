@@ -194,7 +194,7 @@ def audio_duration(path):
 
 
 def generate_audio(text, voice_name, output_file):
-    piper = resource("piper.exe")
+    piper = BASE / "piper.exe"
 
     models = {
         "Мужской": VOICES / "ru_RU-ruslan-medium.onnx",
@@ -203,44 +203,46 @@ def generate_audio(text, voice_name, output_file):
 
     model = models[voice_name]
 
-    if not model.exists():
+    if not piper.exists():
         raise RuntimeError(
-            f"Не найдена голосовая модель:\n{model}"
+            "Не найден piper.exe"
         )
 
-        espeak_path = BASE / "espeak-ng-data"
+    if not model.exists():
+        raise RuntimeError(
+            f"Не найдена модель голоса:\n{model}"
+        )
+
+    espeak_path = BASE / "espeak-ng-data"
 
     if not espeak_path.exists():
         raise RuntimeError(
-            "Не найдена папка espeak-ng-data. "
-            "Проверь комплектацию Piper."
+            "Не найдена папка espeak-ng-data"
         )
 
-    command = [
-        str(piper),
-        "--model", str(model),
-        "--output_file", str(output_file)
-    ]
+    env = os.environ.copy()
+    env["ESPEAK_DATA_PATH"] = str(espeak_path)
 
     result = subprocess.run(
-        command,
+        [
+            str(piper),
+            "--model", str(model),
+            "--output_file", str(output_file)
+        ],
         input=text,
         text=True,
         encoding="utf-8",
         errors="replace",
         capture_output=True,
         cwd=str(BASE),
-        env={
-            **os.environ,
-            "ESPEAK_DATA_PATH": str(espeak_path)
-        },
+        env=env,
         creationflags=subprocess.CREATE_NO_WINDOW
     )
 
     if result.returncode != 0:
-        raise RuntimeError(result.stderr[-2000:])
-
-
+        raise RuntimeError(
+            result.stderr[-2000:]
+        )
 def create_scene_video(image, audio, output):
     duration = audio_duration(audio)
 

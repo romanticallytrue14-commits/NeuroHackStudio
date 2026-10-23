@@ -13,7 +13,7 @@ import wave
 import json
 import shutil
 import uuid
-
+import traceback
 
 # ==========================================
 # НАСТРОЙКИ ПРОГРАММЫ
@@ -999,9 +999,18 @@ def process_video(
             )
         )
 
-    except Exception as error:
+        except Exception as error:
 
-        error_text = str(error)
+        error_text = traceback.format_exc()
+
+        log_file = BASE / "error_log.txt"
+
+        log_file.write_text(
+            error_text,
+            encoding="utf-8"
+        )
+
+        print(error_text)
 
         root.after(
             0,
@@ -1014,10 +1023,10 @@ def process_video(
             0,
             lambda: messagebox.showerror(
                 "Ошибка",
-                error_text
+                f"{type(error).__name__}: {error}\n\n"
+                "Подробности сохранены в error_log.txt"
             )
         )
-
     finally:
 
         root.after(

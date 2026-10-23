@@ -2,7 +2,6 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
-
 import subprocess
 import threading
 import datetime
@@ -11,15 +10,15 @@ import sys
 import re
 import wave
 import json
-import shutil
 import uuid
 import traceback
 
+
 # ==========================================
-# НАСТРОЙКИ ПРОГРАММЫ
+# НАСТРОЙКИ
 # ==========================================
 
-APP_NAME = "НЕЙРОХАК СТУДИЯ 3.1"
+APP_NAME = "НЕЙРОХАК СТУДИЯ 3.2"
 
 WIDTH = 720
 HEIGHT = 1280
@@ -31,14 +30,13 @@ PURPLE = "#8B5CF6"
 WHITE = "#FFFFFF"
 
 
-def base_dir():
+def get_base_dir():
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
-
     return Path(__file__).parent
 
 
-BASE = base_dir()
+BASE = get_base_dir()
 
 OUTPUT = BASE / "output"
 PROJECTS = BASE / "projects"
@@ -47,11 +45,10 @@ VOICES = BASE / "voices"
 OUTPUT.mkdir(exist_ok=True)
 PROJECTS.mkdir(exist_ok=True)
 
-
-FONT_PATH = "C:/Windows/Fonts/arial.ttf"
+FONT = Path("C:/Windows/Fonts/arial.ttf")
 
 materials = []
-scene_assignments = {}
+assignments = {}
 scenes = []
 
 
@@ -59,39 +56,35 @@ scenes = []
 # КОПИРОВАНИЕ И ВСТАВКА
 # ==========================================
 
-def setup_clipboard(widget):
+def enable_clipboard(widget):
 
-    menu = tk.Menu(
-        widget,
-        tearoff=0
-    )
-
-    menu.add_command(
-        label="✂ Вырезать",
-        command=lambda: widget.event_generate("<<Cut>>")
-    )
-
-    menu.add_command(
-        label="📋 Копировать",
-        command=lambda: widget.event_generate("<<Copy>>")
-    )
-
-    menu.add_command(
-        label="📥 Вставить",
-        command=lambda: widget.event_generate("<<Paste>>")
-    )
-
-    menu.add_separator()
+    menu = tk.Menu(widget, tearoff=0)
 
     def select_all():
+        widget.focus_set()
+
         if isinstance(widget, tk.Text):
             widget.tag_add("sel", "1.0", "end-1c")
             widget.mark_set("insert", "1.0")
         else:
             widget.select_range(0, tk.END)
-            widget.icursor(tk.END)
 
-        widget.focus_set()
+    menu.add_command(
+        label="Вырезать",
+        command=lambda: widget.event_generate("<<Cut>>")
+    )
+
+    menu.add_command(
+        label="Копировать",
+        command=lambda: widget.event_generate("<<Copy>>")
+    )
+
+    menu.add_command(
+        label="Вставить",
+        command=lambda: widget.event_generate("<<Paste>>")
+    )
+
+    menu.add_separator()
 
     menu.add_command(
         label="Выделить всё",
@@ -100,40 +93,30 @@ def setup_clipboard(widget):
 
     def show_menu(event):
         widget.focus_set()
-
         try:
-            menu.tk_popup(
-                event.x_root,
-                event.y_root
-            )
+            menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
 
-        return "break"
+    widget.bind("<Button-3>", show_menu)
 
-    widget.bind(
-        "<Button-3>",
-        show_menu
-    )
+    def handle_keys(event):
 
-    # Windows keycodes:
-    # A = 65
-    # C = 67
-    # V = 86
-    # X = 88
-    #
-    # Они не зависят от русской раскладки.
+        ctrl = bool(event.state & 0x4)
 
-    def keyboard_handler(event):
-
-        ctrl_pressed = bool(event.state & 0x4)
-
-        if not ctrl_pressed:
+        if not ctrl:
             return None
 
-        # Не перехватываем Alt+Ctrl.
+        # Не перехватываем Alt+Ctrl
         if event.state & 0x8:
             return None
+
+        keys = {
+            65: "<<SelectAll>>",
+            67: "<<Copy>>",
+            86: "<<Paste>>",
+            88: "<<Cut>>"
+        }
 
         key = event.keycode
 
@@ -141,87 +124,102 @@ def setup_clipboard(widget):
             select_all()
             return "break"
 
-        if key == 67:
-            widget.event_generate("<<Copy>>")
-            return "break"
-
-        if key == 86:
-            widget.event_generate("<<Paste>>")
-            return "break"
-
-        if key == 88:
-            widget.event_generate("<<Cut>>")
+        if key in keys:
+            widget.event_generate(keys[key])
             return "break"
 
         return None
 
-    widget.bind(
-        "<KeyPress>",
-        keyboard_handler
-    )
+    widget.bind("<KeyPress>", handle_keys)
 
 
 # ==========================================
-# ЗАПУСК ВНЕШНИХ ПРОГРАММ
+# ВЫПОЛНЕНИЕ КОМАНД
 # ==========================================
 
-def run_command(command, input_text=None, cwd=None):
+def run_command(command, cwd=None):
 
     result = subprocess.run(
         command,
-        input=input_text,
+        capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
-        capture_output=True,
         cwd=cwd,
         creationflags=subprocess.CREATE_NO_WINDOW
     )
 
     if result.returncode != 0:
+        error = result.stderr.strip()
 
-        error = result.stderr[-3000:]
+        if not error:
+            error = result.stdout.strip()
 
         raise RuntimeError(
-            error or "Ошибка выполнения команды"
+            error[-3000:] if error
+            else f"Команда завершилась с кодом {result.returncode}"
         )
 
     return result
 
 
 # ==========================================
-# РАЗДЕЛЕНИЕ ТЕКСТА НА СЦЕНЫ
+# ПРОВЕРКА КОМПОНЕНТОВ
 # ==========================================
 
-def split_text(text, max_chars=85):
+def check_components(voice):
 
-    sentences = re.split(
-        r'(?<=[.!?])\s+',
-        text.strip()
-    )
+    required = [
+        BASE / "ffmpeg.exe",
+        BASE / "piper.exe",
+        BASE / "espeak-ng-data"
+    ]
+
+    models = {
+        "Мужской": "ru_RU-ruslan-medium.onnx",
+        "Женский": "ru_RU-irina-medium.onnx"
+    }
+
+    model = VOICES / models[voice]
+
+    required.append(model)
+    required.append(Path(str(model) + ".json"))
+
+    missing = [
+        str(path)
+        for path in required
+        if not path.exists()
+    ]
+
+    if missing:
+        raise RuntimeError(
+            "Не найдены компоненты:\n"
+            + "\n".join(missing)
+        )
+
+
+# ==========================================
+# РАЗДЕЛЕНИЕ СЦЕНАРИЯ
+# ==========================================
+
+def split_script(text, limit=85):
+
+    words = text.strip().split()
 
     result = []
     current = ""
 
-    for sentence in sentences:
+    for word in words:
 
-        # Длинные предложения разбиваем по словам.
-        words = sentence.split()
+        candidate = (current + " " + word).strip()
 
-        for word in words:
+        if len(candidate) <= limit:
+            current = candidate
+        else:
+            if current:
+                result.append(current)
 
-            candidate = (
-                current + " " + word
-            ).strip()
-
-            if len(candidate) <= max_chars:
-                current = candidate
-
-            else:
-                if current:
-                    result.append(current)
-
-                current = word
+            current = word
 
     if current:
         result.append(current)
@@ -235,30 +233,24 @@ def split_text(text, max_chars=85):
 
 def wrap_text(draw, text, font, max_width):
 
-    words = text.split()
-
     lines = []
     current = ""
 
-    for word in words:
+    for word in text.split():
 
-        candidate = (
-            current + " " + word
-        ).strip()
+        candidate = (current + " " + word).strip()
 
-        bbox = draw.textbbox(
+        box = draw.textbbox(
             (0, 0),
             candidate,
             font=font
         )
 
-        text_width = bbox[2] - bbox[0]
+        width = box[2] - box[0]
 
-        if text_width <= max_width:
+        if width <= max_width:
             current = candidate
-
         else:
-
             if current:
                 lines.append(current)
 
@@ -271,16 +263,13 @@ def wrap_text(draw, text, font, max_width):
 
 
 # ==========================================
-# СОЗДАНИЕ КИБЕРПАНК-ОФОРМЛЕНИЯ
+# СОЗДАНИЕ ОФОРМЛЕНИЯ
 # ==========================================
 
-def create_overlay(
-    title,
-    scene_text,
-    number,
-    total,
-    output_path
-):
+def create_overlay(title, text, number, total, path):
+
+    if not FONT.exists():
+        raise RuntimeError("Не найден шрифт Arial")
 
     image = Image.new(
         "RGBA",
@@ -290,57 +279,37 @@ def create_overlay(
 
     draw = ImageDraw.Draw(image)
 
-    brand_font = ImageFont.truetype(
-        FONT_PATH,
-        46
-    )
+    brand_font = ImageFont.truetype(str(FONT), 45)
+    title_font = ImageFont.truetype(str(FONT), 34)
+    small_font = ImageFont.truetype(str(FONT), 23)
 
-    title_font = ImageFont.truetype(
-        FONT_PATH,
-        38
-    )
-
-    text_font = ImageFont.truetype(
-        FONT_PATH,
-        34
-    )
-
-    small_font = ImageFont.truetype(
-        FONT_PATH,
-        24
-    )
-
-    # Верхняя полупрозрачная панель
+    # Верхняя панель
 
     draw.rounded_rectangle(
-        (25, 35, 695, 235),
+        (25, 35, 695, 240),
         radius=25,
-        fill=(8, 11, 22, 220),
+        fill=(8, 11, 22, 225),
         outline=CYAN,
         width=3
     )
 
-    # Бренд
-
     draw.text(
-        (WIDTH // 2, 85),
+        (WIDTH // 2, 90),
         "НЕЙРОХАК",
         font=brand_font,
         fill=CYAN,
         anchor="mm"
     )
 
-    # Заголовок
-
     wrapped_title = wrap_text(
         draw,
-        title[:70],
+        title[:65],
         title_font,
-        590
+        580
     )
 
     draw.multiline_text(
-        (WIDTH // 2, 160),
+        (WIDTH // 2, 165),
         wrapped_title,
         font=title_font,
         fill=WHITE,
@@ -349,126 +318,92 @@ def create_overlay(
         spacing=8
     )
 
-    # Нижняя панель для субтитров
+    # Нижняя панель
 
     draw.rounded_rectangle(
-        (25, 750, 695, 1110),
+        (25, 750, 695, 1120),
         radius=30,
-        fill=(8, 11, 22, 225),
+        fill=(8, 11, 22, 230),
         outline=CYAN,
         width=3
     )
 
-    wrapped_text = wrap_text(
-        draw,
-        scene_text,
-        text_font,
-        570
-    )
+    selected_font = None
+    wrapped = ""
 
-    # Подбираем размер, если текст не помещается.
+    for size in range(36, 17, -2):
 
-    for size in range(34, 19, -2):
-
-        test_font = ImageFont.truetype(
-            FONT_PATH,
-            size
-        )
+        font = ImageFont.truetype(str(FONT), size)
 
         candidate = wrap_text(
             draw,
-            scene_text,
-            test_font,
+            text,
+            font,
             570
         )
 
-        bbox = draw.multiline_textbbox(
+        box = draw.multiline_textbbox(
             (0, 0),
             candidate,
-            font=test_font,
-            spacing=10,
-            align="center"
+            font=font,
+            spacing=10
         )
 
-        text_height = bbox[3] - bbox[1]
+        height = box[3] - box[1]
 
-        if text_height <= 290:
-
-            wrapped_text = candidate
-            text_font = test_font
+        if height <= 280:
+            selected_font = font
+            wrapped = candidate
             break
+
+    if selected_font is None:
+        raise RuntimeError(
+            "Текст сцены слишком длинный для отображения"
+        )
 
     draw.multiline_text(
         (WIDTH // 2, 930),
-        wrapped_text,
-        font=text_font,
+        wrapped,
+        font=selected_font,
         fill=WHITE,
         anchor="mm",
         align="center",
         spacing=10
     )
 
-    # Номер сцены
-
     draw.text(
-        (WIDTH // 2, 1180),
-        f"VK • НЕЙРОХАК  |  {number}/{total}",
+        (WIDTH // 2, 1190),
+        f"VK • НЕЙРОХАК | {number}/{total}",
         font=small_font,
         fill=PURPLE,
         anchor="mm"
     )
 
-    image.save(output_path)
+    image.save(path)
 
 
 # ==========================================
-# РУССКАЯ ОЗВУЧКА PIPER
+# ОЗВУЧКА PIPER
 # ==========================================
 
-def generate_audio(
-    text,
-    voice_name,
-    output_file
-):
-
-    piper = BASE / "piper.exe"
+def generate_voice(text, voice, output_file):
 
     models = {
-        "Мужской":
-            VOICES / "ru_RU-ruslan-medium.onnx",
-
-        "Женский":
-            VOICES / "ru_RU-irina-medium.onnx"
+        "Мужской": "ru_RU-ruslan-medium.onnx",
+        "Женский": "ru_RU-irina-medium.onnx"
     }
 
-    model = models[voice_name]
-
-    if not piper.exists():
-        raise RuntimeError(
-            "Не найден piper.exe"
-        )
-
-    if not model.exists():
-        raise RuntimeError(
-            f"Не найдена модель голоса:\n{model}"
-        )
-
-    espeak_path = BASE / "espeak-ng-data"
-
-    if not espeak_path.exists():
-        raise RuntimeError(
-            "Не найдена папка espeak-ng-data"
-        )
+    model = VOICES / models[voice]
 
     env = os.environ.copy()
 
     env["ESPEAK_DATA_PATH"] = str(
-        espeak_path
+        BASE / "espeak-ng-data"
     )
 
     result = subprocess.run(
         [
-            str(piper),
+            str(BASE / "piper.exe"),
             "--model",
             str(model),
             "--output_file",
@@ -485,71 +420,54 @@ def generate_audio(
     )
 
     if result.returncode != 0:
+
+        error = result.stderr.strip()
+
         raise RuntimeError(
-            result.stderr[-3000:]
+            error[-3000:] if error
+            else "Ошибка генерации озвучки"
+        )
+
+    if not output_file.exists():
+        raise RuntimeError(
+            "Piper не создал аудиофайл"
         )
 
 
 # ==========================================
-# ПРОДОЛЖИТЕЛЬНОСТЬ АУДИО
+# ДЛИТЕЛЬНОСТЬ АУДИО
 # ==========================================
 
-def audio_duration(path):
+def get_audio_duration(path):
 
-    with wave.open(
-        str(path),
-        "rb"
-    ) as audio:
+    with wave.open(str(path), "rb") as audio:
 
-        return (
-            audio.getnframes()
-            / audio.getframerate()
-        )
+        frames = audio.getnframes()
+        rate = audio.getframerate()
+
+        return frames / rate
 
 
 # ==========================================
 # СОЗДАНИЕ ВИДЕОСЦЕНЫ
 # ==========================================
 
-def create_scene_video(
-    background,
-    overlay,
-    audio,
-    output
-):
+def create_video_scene(background, overlay, audio, output):
 
-    ffmpeg = BASE / "ffmpeg.exe"
-
-    if not ffmpeg.exists():
-        raise RuntimeError(
-            "Не найден ffmpeg.exe"
-        )
-
-    duration = audio_duration(audio)
+    duration = get_audio_duration(audio)
 
     if duration <= 0:
-        raise RuntimeError(
-            "Озвучка имеет нулевую длительность"
-        )
+        raise RuntimeError("Пустой аудиофайл")
 
-    command = [
-        str(ffmpeg),
-        "-y"
-    ]
+    ffmpeg = str(BASE / "ffmpeg.exe")
 
-    # Выбираем источник фона.
+    command = [ffmpeg, "-y"]
 
     if background:
 
-        extension = Path(
-            background
-        ).suffix.lower()
+        extension = Path(background).suffix.lower()
 
-        if extension in [
-            ".jpg",
-            ".jpeg",
-            ".png"
-        ]:
+        if extension in (".jpg", ".jpeg", ".png"):
 
             command += [
                 "-loop", "1",
@@ -565,9 +483,8 @@ def create_scene_video(
             ]
 
         else:
-
             raise RuntimeError(
-                "Неподдерживаемый формат материала"
+                f"Неподдерживаемый формат: {extension}"
             )
 
     else:
@@ -575,11 +492,7 @@ def create_scene_video(
         command += [
             "-f", "lavfi",
             "-i",
-            (
-                f"color=c=0x080B16:"
-                f"s={WIDTH}x{HEIGHT}:"
-                f"r={FPS}"
-            )
+            f"color=c=0x080B16:s={WIDTH}x{HEIGHT}:r={FPS}"
         ]
 
     command += [
@@ -589,40 +502,35 @@ def create_scene_video(
         "-i", str(audio)
     ]
 
-    filter_complex = (
+    filters = (
         "[0:v]"
         "scale=720:1280:"
         "force_original_aspect_ratio=increase,"
         "crop=720:1280,"
         "setsar=1,"
-        "fps=25,"
-        "format=yuv420p[bg];"
+        "fps=25[bg];"
         "[bg][1:v]"
-        "overlay=0:0:"
-        "format=auto,"
+        "overlay=0:0,"
         "format=yuv420p[v]"
     )
 
     command += [
-        "-filter_complex",
-        filter_complex,
+        "-filter_complex", filters,
 
         "-map", "[v]",
         "-map", "2:a:0",
 
         "-t", str(duration),
 
-        "-r", str(FPS),
-
         "-c:v", "libx264",
         "-preset", "ultrafast",
         "-crf", "26",
-
         "-pix_fmt", "yuv420p",
+
+        "-r", str(FPS),
 
         "-c:a", "aac",
         "-b:a", "128k",
-
         "-ar", "44100",
 
         "-movflags", "+faststart",
@@ -632,40 +540,35 @@ def create_scene_video(
 
     run_command(command)
 
+    if not output.exists() or output.stat().st_size == 0:
+        raise RuntimeError("FFmpeg не создал видео")
+
 
 # ==========================================
-# ДОБАВЛЕНИЕ МАТЕРИАЛОВ
+# МАТЕРИАЛЫ
 # ==========================================
 
 def add_materials():
 
     files = filedialog.askopenfilenames(
-        title="Выберите фотографии и видео",
+        title="Выберите фото и видео",
         filetypes=[
-            (
-                "Медиафайлы",
-                "*.mp4 *.jpg *.jpeg *.png"
-            )
+            ("Медиа", "*.mp4 *.jpg *.jpeg *.png")
         ]
     )
 
     for file in files:
-
         if file not in materials:
             materials.append(file)
 
-    update_materials()
+    refresh_materials()
 
 
-def update_materials():
+def refresh_materials():
 
-    materials_list.delete(
-        0,
-        tk.END
-    )
+    materials_list.delete(0, tk.END)
 
     for file in materials:
-
         materials_list.insert(
             tk.END,
             Path(file).name
@@ -675,51 +578,44 @@ def update_materials():
 def clear_materials():
 
     materials.clear()
-    scene_assignments.clear()
+    assignments.clear()
 
-    update_materials()
+    refresh_materials()
 
-    status_var.set(
-        "Материалы очищены"
-    )
+    status_var.set("Материалы очищены")
 
 
 # ==========================================
-# ПОДГОТОВКА СЦЕН
+# СЦЕНЫ
 # ==========================================
 
 def prepare_scenes():
 
     global scenes
 
-    script = script_text.get(
+    text = script_text.get(
         "1.0",
-        tk.END
+        "end-1c"
     ).strip()
 
-    if not script:
-
+    if not text:
         messagebox.showwarning(
             "Ошибка",
             "Введите сценарий"
         )
-
         return
 
-    scenes = split_text(script)
+    scenes = split_script(text)
 
-    scene_assignments.clear()
+    assignments.clear()
 
-    scene_list.delete(
-        0,
-        tk.END
-    )
+    scene_list.delete(0, tk.END)
 
-    for index, scene in enumerate(scenes):
+    for i, scene in enumerate(scenes):
 
         scene_list.insert(
             tk.END,
-            f"{index + 1}. {scene[:65]}"
+            f"{i + 1}. {scene[:60]}"
         )
 
     status_var.set(
@@ -727,50 +623,73 @@ def prepare_scenes():
     )
 
 
-# ==========================================
-# РУЧНОЕ НАЗНАЧЕНИЕ МАТЕРИАЛОВ
-# ==========================================
-
 def assign_material():
 
     selected_scene = scene_list.curselection()
+    selected_media = materials_list.curselection()
 
-    selected_material = (
-        materials_list.curselection()
-    )
-
-    if not selected_scene or not selected_material:
+    if not selected_scene or not selected_media:
 
         messagebox.showwarning(
             "Ошибка",
             "Выберите сцену и материал"
         )
-
         return
 
-    scene_index = selected_scene[0]
-    material_index = selected_material[0]
+    index = selected_scene[0]
 
-    scene_assignments[scene_index] = (
-        materials[material_index]
-    )
+    assignments[index] = materials[selected_media[0]]
 
     status_var.set(
-        f"Материал назначен сцене {scene_index + 1}"
+        f"Материал назначен сцене {index + 1}"
     )
 
 
 # ==========================================
-# СОЗДАНИЕ ВИДЕО
+# БЕЗОПАСНОЕ ОБНОВЛЕНИЕ ИНТЕРФЕЙСА
 # ==========================================
 
-def build_video():
+def set_status(text):
+
+    root.after(
+        0,
+        lambda value=text: status_var.set(value)
+    )
+
+
+def show_error(text):
+
+    root.after(
+        0,
+        lambda value=text: messagebox.showerror(
+            "Ошибка",
+            value
+        )
+    )
+
+
+def show_success(text):
+
+    root.after(
+        0,
+        lambda value=text: messagebox.showinfo(
+            "Готово",
+            value
+        )
+    )
+
+
+# ==========================================
+# СОЗДАНИЕ РОЛИКА
+# ==========================================
+
+def start_creation():
 
     title = title_entry.get().strip()
 
     script = script_text.get(
         "1.0",
-        tk.END
+        "end-1c"
     ).strip()
 
     voice = voice_var.get()
@@ -782,27 +701,35 @@ def build_video():
             "Ошибка",
             "Введите название и сценарий"
         )
-
         return
 
-    current_scenes = split_text(script)
+    try:
+        check_components(voice)
+    except Exception as error:
+        messagebox.showerror(
+            "Ошибка компонентов",
+            str(error)
+        )
+        return
 
-    # Передаём копии данных, чтобы изменения
-    # интерфейса не влияли на текущую сборку.
+    current_scenes = split_script(script)
 
     current_materials = list(materials)
+    current_assignments = dict(assignments)
 
-    current_assignments = dict(
-        scene_assignments
-    )
+    # Не используем старые назначения,
+    # если сценарий изменился после подготовки.
+    if mode == "Ручной" and current_scenes != scenes:
+        messagebox.showwarning(
+            "Обновите сцены",
+            "Сценарий изменился. Перейдите во вкладку "
+            "«Материалы» и нажмите «Подготовить сцены»."
+        )
+        return
 
-    create_button.config(
-        state="disabled"
-    )
+    create_button.config(state="disabled")
 
-    status_var.set(
-        "Создание видео..."
-    )
+    set_status("Создание видео...")
 
     thread = threading.Thread(
         target=process_video,
@@ -831,10 +758,8 @@ def process_video(
 
     try:
 
-        timestamp = (
-            datetime.datetime.now().strftime(
-                "%Y%m%d_%H%M%S"
-            )
+        timestamp = datetime.datetime.now().strftime(
+            "%Y%m%d_%H%M%S"
         )
 
         project_id = (
@@ -844,6 +769,7 @@ def process_video(
         workdir = PROJECTS / project_id
 
         workdir.mkdir(
+            parents=True,
             exist_ok=True
         )
 
@@ -853,35 +779,23 @@ def process_video(
 
         for index, scene in enumerate(current_scenes):
 
-            root.after(
-                0,
-                lambda i=index, n=total:
-                status_var.set(
-                    f"Создание сцены {i + 1}/{n}"
-                )
+            set_status(
+                f"Создание сцены {index + 1}/{total}"
             )
 
-            image = (
-                workdir / f"overlay_{index:03d}.png"
-            )
-
-            audio = (
-                workdir / f"audio_{index:03d}.wav"
-            )
-
-            video = (
-                workdir / f"scene_{index:03d}.mp4"
-            )
+            overlay = workdir / f"overlay_{index:03d}.png"
+            audio = workdir / f"audio_{index:03d}.wav"
+            video = workdir / f"scene_{index:03d}.mp4"
 
             create_overlay(
                 title,
                 scene,
                 index + 1,
                 total,
-                image
+                overlay
             )
 
-            generate_audio(
+            generate_voice(
                 scene,
                 voice,
                 audio
@@ -892,20 +806,17 @@ def process_video(
             if mode == "Авто":
 
                 if current_materials:
-
                     background = current_materials[
                         index % len(current_materials)
                     ]
 
             else:
 
-                background = (
-                    current_assignments.get(index)
-                )
+                background = current_assignments.get(index)
 
-            create_scene_video(
+            create_video_scene(
                 background,
-                image,
+                overlay,
                 audio,
                 video
             )
@@ -913,29 +824,24 @@ def process_video(
             video_files.append(video)
 
         # ==================================
-        # ОБЪЕДИНЕНИЕ СЦЕН
+        # ОБЪЕДИНЕНИЕ ВИДЕО
         # ==================================
 
-        concat_file = (
-            workdir / "concat.txt"
-        )
+        set_status("Объединение сцен...")
 
-        lines = []
+        concat_file = workdir / "concat.txt"
 
-        for video in video_files:
-
-            lines.append(
-                f"file '{video.name}'"
-            )
+        lines = [
+            f"file '{video.name}'"
+            for video in video_files
+        ]
 
         concat_file.write_text(
             "\n".join(lines),
             encoding="utf-8"
         )
 
-        output_file = (
-            OUTPUT / f"neurohack_{project_id}.mp4"
-        )
+        final_video = OUTPUT / f"neurohack_{project_id}.mp4"
 
         run_command(
             [
@@ -952,81 +858,67 @@ def process_video(
 
                 "-movflags", "+faststart",
 
-                str(output_file)
+                str(final_video)
             ],
             cwd=str(workdir)
         )
 
+        if not final_video.exists():
+            raise RuntimeError(
+                "Итоговый MP4 не создан"
+            )
+
         # ==================================
-        # СОХРАНЕНИЕ ИНФОРМАЦИИ О ПРОЕКТЕ
+        # СОХРАНЕНИЕ ПРОЕКТА
         # ==================================
 
-        project_info = {
+        project_data = {
             "title": title,
             "voice": voice,
             "mode": mode,
             "scenes": current_scenes,
             "materials": current_materials,
             "assignments": current_assignments,
-            "output": str(output_file)
+            "output": str(final_video)
         }
 
-        project_file = (
-            workdir / "project.json"
-        )
+        project_file = workdir / "project.json"
 
         project_file.write_text(
             json.dumps(
-                project_info,
+                project_data,
                 ensure_ascii=False,
                 indent=2
             ),
             encoding="utf-8"
         )
 
-        root.after(
-            0,
-            lambda: status_var.set(
-                "Видео успешно создано!"
-            )
+        set_status("Видео успешно создано!")
+
+        show_success(
+            f"Видео сохранено:\n{final_video}"
         )
 
-        root.after(
-            0,
-            lambda: messagebox.showinfo(
-                "Готово!",
-                f"Видео сохранено:\n{output_file}"
-            )
-        )
-
-        except Exception as error:
+    except Exception:
 
         error_text = traceback.format_exc()
 
         log_file = BASE / "error_log.txt"
 
-        log_file.write_text(
-            error_text,
-            encoding="utf-8"
-        )
-
-        print(error_text)
-
-        root.after(
-            0,
-            lambda: status_var.set(
-                "Ошибка создания видео"
+        try:
+            log_file.write_text(
+                error_text,
+                encoding="utf-8"
             )
+        except OSError:
+            pass
+
+        set_status("Ошибка создания видео")
+
+        show_error(
+            error_text[-2500:]
         )
 
-        root.after(
-            0,
-            lambda: messagebox.showerror(
-                "Ошибка",
-                f"{type(error).__name__}: {error}\n\n"
-                "Подробности сохранены в error_log.txt"
-            )
-        )
     finally:
 
         root.after(
@@ -1064,21 +956,16 @@ root.configure(bg=BG)
 
 
 # ==========================================
-# ЗАГОЛОВОК
+# ВЕРХНЯЯ ПАНЕЛЬ
 # ==========================================
 
-header = tk.Frame(
-    root,
-    bg=BG
-)
+header = tk.Frame(root, bg=BG)
 
-header.pack(
-    fill="x"
-)
+header.pack(fill="x")
 
 tk.Label(
     header,
-    text="⚡ НЕЙРОХАК СТУДИЯ 3.1",
+    text="⚡ НЕЙРОХАК СТУДИЯ 3.2",
     font=("Arial", 21, "bold"),
     fg=CYAN,
     bg=BG
@@ -1087,15 +974,11 @@ tk.Label(
 
 # ==========================================
 # НИЖНЯЯ ПАНЕЛЬ
-# КНОПКА ВСЕГДА ВИДНА
 # ==========================================
 
-bottom_frame = tk.Frame(
-    root,
-    bg=BG
-)
+bottom = tk.Frame(root, bg=BG)
 
-bottom_frame.pack(
+bottom.pack(
     side="bottom",
     fill="x"
 )
@@ -1105,9 +988,9 @@ status_var = tk.StringVar(
 )
 
 create_button = tk.Button(
-    bottom_frame,
+    bottom,
     text="🎬 СОЗДАТЬ VK КЛИП",
-    command=build_video,
+    command=start_creation,
     bg=CYAN,
     fg="black",
     font=("Arial", 13, "bold"),
@@ -1121,11 +1004,10 @@ create_button.pack(
 )
 
 tk.Label(
-    bottom_frame,
+    bottom,
     textvariable=status_var,
     fg=CYAN,
-    bg=BG,
-    font=("Arial", 10)
+    bg=BG
 ).pack(pady=5)
 
 
@@ -1142,39 +1024,28 @@ notebook.pack(
     pady=10
 )
 
-tab_video = tk.Frame(
-    notebook,
-    bg=BG
-)
-
-tab_materials = tk.Frame(
-    notebook,
-    bg=BG
-)
-
-tab_settings = tk.Frame(
-    notebook,
-    bg=BG
-)
+tab_video = tk.Frame(notebook, bg=BG)
+tab_media = tk.Frame(notebook, bg=BG)
+tab_settings = tk.Frame(notebook, bg=BG)
 
 notebook.add(
     tab_video,
-    text="🎬 Создание видео"
+    text="Создание видео"
 )
 
 notebook.add(
-    tab_materials,
-    text="📁 Материалы"
+    tab_media,
+    text="Материалы"
 )
 
 notebook.add(
     tab_settings,
-    text="⚙ Настройки"
+    text="Настройки"
 )
 
 
 # ==========================================
-# ВКЛАДКА 1. СОЗДАНИЕ ВИДЕО
+# ВКЛАДКА СОЗДАНИЯ ВИДЕО
 # ==========================================
 
 tk.Label(
@@ -1182,7 +1053,7 @@ tk.Label(
     text="Название ролика",
     fg=WHITE,
     bg=BG
-).pack(pady=(10, 2))
+).pack(pady=5)
 
 title_entry = tk.Entry(
     tab_video,
@@ -1195,7 +1066,7 @@ title_entry.pack(
     pady=5
 )
 
-setup_clipboard(title_entry)
+enable_clipboard(title_entry)
 
 
 tk.Label(
@@ -1205,33 +1076,30 @@ tk.Label(
     bg=BG
 ).pack(pady=5)
 
-script_frame = tk.Frame(
+text_frame = tk.Frame(
     tab_video,
     bg=BG
 )
 
-script_frame.pack(
+text_frame.pack(
     fill="both",
     expand=True,
-    padx=20,
-    pady=5
+    padx=20
 )
 
-script_scroll = tk.Scrollbar(
-    script_frame
-)
+scrollbar = tk.Scrollbar(text_frame)
 
-script_scroll.pack(
+scrollbar.pack(
     side="right",
     fill="y"
 )
 
 script_text = tk.Text(
-    script_frame,
+    text_frame,
     font=("Arial", 11),
     wrap="word",
     undo=True,
-    yscrollcommand=script_scroll.set
+    yscrollcommand=scrollbar.set
 )
 
 script_text.pack(
@@ -1240,27 +1108,23 @@ script_text.pack(
     expand=True
 )
 
-script_scroll.config(
+scrollbar.config(
     command=script_text.yview
 )
 
-setup_clipboard(script_text)
+enable_clipboard(script_text)
 
 
 # ==========================================
-# НАСТРОЙКИ ГОЛОСА И РЕЖИМА
+# ГОЛОС И РЕЖИМ
 # ==========================================
 
-controls_frame = tk.Frame(
+controls = tk.Frame(
     tab_video,
     bg=BG
 )
 
-controls_frame.pack(
-    fill="x",
-    padx=20,
-    pady=10
-)
+controls.pack(pady=10)
 
 voice_var = tk.StringVar(
     value="Мужской"
@@ -1271,14 +1135,14 @@ mode_var = tk.StringVar(
 )
 
 tk.Label(
-    controls_frame,
+    controls,
     text="Голос:",
     fg=WHITE,
     bg=BG
 ).pack(side="left")
 
 ttk.Combobox(
-    controls_frame,
+    controls,
     textvariable=voice_var,
     values=[
         "Мужской",
@@ -1292,17 +1156,14 @@ ttk.Combobox(
 )
 
 tk.Label(
-    controls_frame,
+    controls,
     text="Режим:",
     fg=WHITE,
     bg=BG
-).pack(
-    side="left",
-    padx=(15, 0)
-)
+).pack(side="left")
 
 ttk.Combobox(
-    controls_frame,
+    controls,
     textvariable=mode_var,
     values=[
         "Авто",
@@ -1317,22 +1178,19 @@ ttk.Combobox(
 
 
 # ==========================================
-# ВКЛАДКА 2. МАТЕРИАЛЫ
+# ВКЛАДКА МАТЕРИАЛОВ
 # ==========================================
 
-materials_buttons = tk.Frame(
-    tab_materials,
+media_buttons = tk.Frame(
+    tab_media,
     bg=BG
 )
 
-materials_buttons.pack(
-    fill="x",
-    pady=10
-)
+media_buttons.pack(pady=10)
 
 tk.Button(
-    materials_buttons,
-    text="📁 Добавить фото и видео",
+    media_buttons,
+    text="Добавить фото и видео",
     command=add_materials,
     bg=CYAN
 ).pack(
@@ -1341,8 +1199,8 @@ tk.Button(
 )
 
 tk.Button(
-    materials_buttons,
-    text="Очистить материалы",
+    media_buttons,
+    text="Очистить",
     command=clear_materials,
     bg=PURPLE,
     fg=WHITE
@@ -1353,14 +1211,14 @@ tk.Button(
 
 
 tk.Label(
-    tab_materials,
-    text="Добавленные материалы",
+    tab_media,
+    text="Загруженные материалы",
     fg=WHITE,
     bg=BG
 ).pack()
 
 materials_list = tk.Listbox(
-    tab_materials,
+    tab_media,
     height=5
 )
 
@@ -1372,7 +1230,7 @@ materials_list.pack(
 
 
 tk.Button(
-    tab_materials,
+    tab_media,
     text="Подготовить сцены",
     command=prepare_scenes,
     bg=PURPLE,
@@ -1381,14 +1239,14 @@ tk.Button(
 
 
 tk.Label(
-    tab_materials,
-    text="Сцены",
+    tab_media,
+    text="Список сцен",
     fg=WHITE,
     bg=BG
 ).pack()
 
 scene_list = tk.Listbox(
-    tab_materials,
+    tab_media,
     height=5
 )
 
@@ -1401,20 +1259,20 @@ scene_list.pack(
 
 
 tk.Button(
-    tab_materials,
-    text="🔗 Назначить материал сцене",
+    tab_media,
+    text="Назначить материал сцене",
     command=assign_material,
     bg=CYAN
 ).pack(pady=10)
 
 
 # ==========================================
-# ВКЛАДКА 3. НАСТРОЙКИ
+# ВКЛАДКА НАСТРОЕК
 # ==========================================
 
 tk.Label(
     tab_settings,
-    text="НЕЙРОХАК СТУДИЯ 3.1",
+    text="НЕЙРОХАК СТУДИЯ 3.2",
     font=("Arial", 17, "bold"),
     fg=CYAN,
     bg=BG
@@ -1424,11 +1282,12 @@ tk.Label(
 tk.Label(
     tab_settings,
     text=(
-        "Формат: 720 × 1280\n"
+        "Разрешение: 720 × 1280\n"
         "Частота: 25 FPS\n"
         "Кодек: H.264\n"
         "Озвучка: Piper TTS\n"
-        "Монтаж: FFmpeg"
+        "Монтаж: FFmpeg\n"
+        "Стоимость: бесплатно"
     ),
     fg=WHITE,
     bg=BG,
@@ -1439,7 +1298,7 @@ tk.Label(
 
 tk.Button(
     tab_settings,
-    text="📁 Открыть готовые видео",
+    text="Открыть готовые видео",
     command=open_output,
     bg=PURPLE,
     fg=WHITE
@@ -1448,7 +1307,7 @@ tk.Button(
 
 tk.Button(
     tab_settings,
-    text="📁 Открыть проекты",
+    text="Открыть проекты",
     command=open_projects,
     bg=PURPLE,
     fg=WHITE

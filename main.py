@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import json
 import wave
 import uuid
@@ -15,10 +16,10 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 # ==========================================
-# НАСТРОЙКИ
+# НЕЙРОХАК СТУДИЯ 3.5
 # ==========================================
 
-VERSION = "3.4"
+VERSION = "3.5"
 APP_NAME = f"НЕЙРОХАК СТУДИЯ {VERSION}"
 
 WIDTH = 720
@@ -30,6 +31,10 @@ CYAN = "#00D9FF"
 PURPLE = "#8B5CF6"
 WHITE = "#FFFFFF"
 
+
+# ==========================================
+# ПАПКИ
+# ==========================================
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -43,8 +48,8 @@ OUTPUT = BASE / "output"
 PROJECTS = BASE / "projects"
 VOICES = BASE / "voices"
 
-for folder in (OUTPUT, PROJECTS):
-    folder.mkdir(parents=True, exist_ok=True)
+OUTPUT.mkdir(parents=True, exist_ok=True)
+PROJECTS.mkdir(parents=True, exist_ok=True)
 
 PIPER = BASE / "piper.exe"
 FFMPEG = BASE / "ffmpeg.exe"
@@ -53,9 +58,16 @@ ESPEAK = BASE / "espeak-ng-data"
 FONT = Path("C:/Windows/Fonts/arial.ttf")
 LOG_FILE = BASE / "error_log.txt"
 
+
 VOICE_MODELS = {
     "Мужской": "ru_RU-ruslan-medium.onnx",
     "Женский": "ru_RU-irina-medium.onnx"
+}
+
+VOICE_SPEEDS = {
+    "Медленная": 1.20,
+    "Нормальная": 1.00,
+    "Быстрая": 0.90
 }
 
 materials = []
@@ -108,7 +120,7 @@ def report_error(error):
 
     text = str(error).strip() or repr(error)
 
-    set_status("Ошибка. Открой журнал во вкладке Настройки.")
+    set_status("Ошибка. Подробности в журнале.")
 
     root.after(
         0,
@@ -160,7 +172,6 @@ def enable_clipboard(widget):
 
     def popup(event):
         widget.focus_set()
-
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -169,7 +180,7 @@ def enable_clipboard(widget):
     widget.bind("<Button-3>", popup)
 
     def keyboard(event):
-        if not event.state & 0x4:
+        if not (event.state & 0x4):
             return None
 
         if event.state & 0x8:
@@ -180,9 +191,6 @@ def enable_clipboard(widget):
             86: "<<Paste>>",
             88: "<<Cut>>"
         }
-
-        # Используем Windows keycode.
-        # Не зависит от русского символа клавиши.
 
         if event.keycode == 65:
             select_all()
@@ -200,7 +208,7 @@ def enable_clipboard(widget):
 
 
 # ==========================================
-# ВНЕШНИЕ КОМАНДЫ
+# ЗАПУСК КОМАНД
 # ==========================================
 
 def run_command(command, cwd=None, env=None, input_data=None):
@@ -226,15 +234,12 @@ def run_command(command, cwd=None, env=None, input_data=None):
     )
 
     if result.returncode != 0:
-
         details = stderr.strip() or stdout.strip()
 
-        if not details:
-            details = "Нет дополнительного вывода."
-
         raise RuntimeError(
-            f"Команда завершилась с кодом "
-            f"{result.returncode}\n\n{details[-2500:]}"
+            f"Код ошибки: {result.returncode}\n\n"
+            + (details[-2500:] if details else
+               "Нет дополнительного вывода.")
         )
 
     return result
@@ -265,38 +270,72 @@ def check_components(voice):
 
     if missing:
         raise RuntimeError(
-            "Не найдены компоненты:\n\n" +
+            "Отсутствуют компоненты:\n\n" +
             "\n".join(missing)
         )
 
     if not (ESPEAK / "phontab").exists():
         raise RuntimeError(
-            "В папке espeak-ng-data отсутствует phontab."
+            "В espeak-ng-data отсутствует phontab."
         )
 
     return model
 
 
 # ==========================================
-# ОЗВУЧКА
+# ПОДГОТОВКА ТЕКСТА
 # ==========================================
 
-def generate_voice(text, voice, output_file):
+def normalize_speech_text(text):
+
+    replacements = {
+        "ChatGPT": "Чат Джи Пи Ти",
+        "Windows 10": "Виндоус десять",
+        "Windows 11": "Виндоус одиннадцать",
+        "Win + Shift + S": "Вин плюс шифт плюс эс",
+        "Win + V": "Вин плюс вэ",
+        "VK": "ВКонтакте"
+    }
+
+    for original, replacement in replacements.items():
+        text = text.replace(original, replacement)
+
+    text = re.sub(
+        r"\bИИ\b",
+        "искусственный интеллект",
+        text
+    )
+
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
+
+
+# ==========================================
+# ГЕНЕРАЦИЯ ОЗВУЧКИ
+# ==========================================
+
+def generate_voice(text, voice, speed, output_file):
 
     model = check_components(voice)
 
-    env = os.environ.copy()
+    clean_text = normalize_speech_text(text)
 
+    if not clean_text:
+        raise RuntimeError("Пустой текст озвучки.")
+
+    env = os.environ.copy()
     env["ESPEAK_DATA_PATH"] = str(ESPEAK)
 
     input_data = (
-        text.strip() + "\n"
+        clean_text + "\n"
     ).encode("utf-8")
 
     command = [
         str(PIPER),
         "--model", str(model),
-        "--output_file", str(output_file)
+        "--output_file", str(output_file),
+        "--length_scale", str(speed)
     ]
 
     run_command(
@@ -313,22 +352,27 @@ def generate_voice(text, voice, output_file):
 
     if output_file.stat().st_size < 100:
         raise RuntimeError(
-            "Piper создал пустой аудиофайл."
+            "Piper создал пустой WAV."
         )
 
     with wave.open(str(output_file), "rb") as audio:
         if audio.getnframes() == 0:
             raise RuntimeError(
-                "В аудиофайле отсутствуют звуковые данные."
+                "Аудиофайл не содержит звука."
             )
 
+
+# ==========================================
+# ПРОВЕРКА ОЗВУЧКИ
+# ==========================================
 
 def test_voice():
 
     voice = voice_var.get()
+    speed = VOICE_SPEEDS[speed_var.get()]
 
     test_button.config(state="disabled")
-    set_status("Проверяем голос...")
+    set_status("Проверяем озвучку...")
 
     def worker():
         try:
@@ -339,15 +383,18 @@ def test_voice():
             )
 
             generate_voice(
-                "Привет! Это Нейрохак. Проверяем русский голос.",
+                "Привет! Это Нейрохак. "
+                "Сегодня мы проверяем качество "
+                "русской озвучки.",
                 voice,
+                speed,
                 output
             )
 
-            set_status("Проверка озвучки завершена.")
+            set_status("Озвучка создана!")
 
             show_info(
-                f"Голос создан!\n\nФайл:\n{output}"
+                f"Файл успешно создан:\n\n{output}"
             )
 
         except Exception as error:
@@ -363,7 +410,7 @@ def test_voice():
 
 
 # ==========================================
-# РАЗДЕЛЕНИЕ ТЕКСТА
+# РАЗДЕЛЕНИЕ НА СЦЕНЫ
 # ==========================================
 
 def split_script(text, limit=85):
@@ -387,6 +434,10 @@ def split_script(text, limit=85):
 
     return result
 
+
+# ==========================================
+# ПЕРЕНОС ТЕКСТА
+# ==========================================
 
 def wrap_text(draw, text, font, max_width):
 
@@ -417,7 +468,7 @@ def wrap_text(draw, text, font, max_width):
 
 
 # ==========================================
-# СОЗДАНИЕ КАРТИНКИ СЦЕНЫ
+# КИБЕРПАНК-ОФОРМЛЕНИЕ
 # ==========================================
 
 def create_overlay(title, text, number, total, output):
@@ -528,7 +579,7 @@ def create_overlay(title, text, number, total, output):
 
 
 # ==========================================
-# ВИДЕОСЦЕНА
+# ПРОДОЛЖИТЕЛЬНОСТЬ АУДИО
 # ==========================================
 
 def audio_duration(path):
@@ -536,6 +587,10 @@ def audio_duration(path):
     with wave.open(str(path), "rb") as audio:
         return audio.getnframes() / audio.getframerate()
 
+
+# ==========================================
+# СОЗДАНИЕ ВИДЕОСЦЕНЫ
+# ==========================================
 
 def create_video_scene(background, overlay, audio, output):
 
@@ -723,6 +778,7 @@ def start_creation():
 
     voice = voice_var.get()
     mode = mode_var.get()
+    speed = VOICE_SPEEDS[speed_var.get()]
 
     if not title or not script:
         messagebox.showwarning(
@@ -742,6 +798,7 @@ def start_creation():
         return
 
     create_button.config(state="disabled")
+    set_status("Начинаем создание видео...")
 
     threading.Thread(
         target=process_video,
@@ -749,6 +806,7 @@ def start_creation():
             title,
             current_scenes,
             voice,
+            speed,
             mode,
             list(materials),
             dict(assignments)
@@ -761,6 +819,7 @@ def process_video(
     title,
     current_scenes,
     voice,
+    speed,
     mode,
     current_materials,
     current_assignments
@@ -799,7 +858,12 @@ def process_video(
                 overlay
             )
 
-            generate_voice(scene, voice, audio)
+            generate_voice(
+                scene,
+                voice,
+                speed,
+                audio
+            )
 
             background = None
 
@@ -859,6 +923,7 @@ def process_video(
         project_info = {
             "title": title,
             "voice": voice,
+            "speed": speed,
             "mode": mode,
             "scenes": current_scenes,
             "materials": current_materials,
@@ -918,8 +983,8 @@ def open_log():
 root = tk.Tk()
 
 root.title(APP_NAME)
-root.geometry("900x650")
-root.minsize(700, 500)
+root.geometry("950x680")
+root.minsize(750, 520)
 root.configure(bg=BG)
 
 
@@ -932,7 +997,7 @@ header.pack(fill="x")
 
 tk.Label(
     header,
-    text="⚡ НЕЙРОХАК СТУДИЯ 3.4",
+    text="⚡ НЕЙРОХАК СТУДИЯ 3.5",
     font=("Arial", 21, "bold"),
     fg=CYAN,
     bg=BG
@@ -999,16 +1064,10 @@ notebook.add(tab_settings, text="Настройки")
 
 
 # ==========================================
-# ВКЛАДКА СОЗДАНИЯ
+# НАСТРОЙКИ ОЗВУЧКИ
 # ==========================================
 
-# Верхний блок настроек.
-# Он находится НАД сценарием.
-
-settings_frame = tk.Frame(
-    tab_video,
-    bg=BG
-)
+settings_frame = tk.Frame(tab_video, bg=BG)
 
 settings_frame.pack(
     side="top",
@@ -1019,6 +1078,7 @@ settings_frame.pack(
 
 voice_var = tk.StringVar(value="Мужской")
 mode_var = tk.StringVar(value="Авто")
+speed_var = tk.StringVar(value="Нормальная")
 
 tk.Label(
     settings_frame,
@@ -1032,7 +1092,26 @@ ttk.Combobox(
     textvariable=voice_var,
     values=["Мужской", "Женский"],
     state="readonly",
-    width=14
+    width=13
+).pack(side="left", padx=5)
+
+tk.Label(
+    settings_frame,
+    text="Скорость:",
+    fg=WHITE,
+    bg=BG
+).pack(side="left", padx=5)
+
+ttk.Combobox(
+    settings_frame,
+    textvariable=speed_var,
+    values=[
+        "Медленная",
+        "Нормальная",
+        "Быстрая"
+    ],
+    state="readonly",
+    width=13
 ).pack(side="left", padx=5)
 
 tk.Label(
@@ -1040,25 +1119,25 @@ tk.Label(
     text="Режим:",
     fg=WHITE,
     bg=BG
-).pack(side="left", padx=10)
+).pack(side="left", padx=5)
 
 ttk.Combobox(
     settings_frame,
     textvariable=mode_var,
     values=["Авто", "Ручной"],
     state="readonly",
-    width=14
+    width=12
 ).pack(side="left", padx=5)
 
 test_button = tk.Button(
     settings_frame,
-    text="🎙 Проверить озвучку",
+    text="🎙 Проверить голос",
     command=test_voice,
     bg=PURPLE,
     fg=WHITE
 )
 
-test_button.pack(side="left", padx=15)
+test_button.pack(side="left", padx=10)
 
 
 # ==========================================
@@ -1163,10 +1242,7 @@ tk.Label(
     bg=BG
 ).pack()
 
-materials_list = tk.Listbox(
-    tab_media,
-    height=5
-)
+materials_list = tk.Listbox(tab_media, height=5)
 
 materials_list.pack(
     fill="x",
@@ -1189,10 +1265,7 @@ tk.Label(
     bg=BG
 ).pack()
 
-scene_list = tk.Listbox(
-    tab_media,
-    height=5
-)
+scene_list = tk.Listbox(tab_media, height=5)
 
 scene_list.pack(
     fill="both",
@@ -1215,7 +1288,7 @@ tk.Button(
 
 tk.Label(
     tab_settings,
-    text="НЕЙРОХАК СТУДИЯ 3.4",
+    text="НЕЙРОХАК СТУДИЯ 3.5",
     font=("Arial", 17, "bold"),
     fg=CYAN,
     bg=BG
@@ -1228,7 +1301,8 @@ tk.Label(
         "Частота: 25 FPS\n"
         "Кодек: H.264\n"
         "Озвучка: Piper TTS\n"
-        "Монтаж: FFmpeg"
+        "Монтаж: FFmpeg\n"
+        "Скорость речи: регулируемая"
     ),
     fg=WHITE,
     bg=BG,

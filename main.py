@@ -3,26 +3,26 @@ import sys
 import re
 import json
 import wave
-import math
 import shutil
-import random
 import tempfile
 import subprocess
 import threading
 import traceback
+
 from pathlib import Path
 from datetime import datetime
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 
 # ============================================================
-# НЕЙРОХАК СТУДИЯ 4.0
+# НЕЙРОХАК СТУДИЯ 4.1
 # ============================================================
 
-APP_NAME = "НЕЙРОХАК СТУДИЯ 4.0"
+APP_NAME = "НЕЙРОХАК СТУДИЯ 4.1"
 
 WIDTH = 720
 HEIGHT = 1280
@@ -46,6 +46,37 @@ VOICE_SPEEDS = {
     "Быстрая": 0.90
 }
 
+SUBTITLE_SIZES = {
+    "Маленькие": 40,
+    "Средние": 54,
+    "Крупные": 66
+}
+
+ACCENT_WORDS = {
+    "нейросеть",
+    "нейросети",
+    "нейросетей",
+    "бесплатно",
+    "бесплатный",
+    "бесплатная",
+    "бесплатные",
+    "искусственный",
+    "интеллект",
+    "технологии",
+    "технология",
+    "секрет",
+    "лайфхак",
+    "лайфхаки",
+    "видео",
+    "время",
+    "деньги",
+    "заработок",
+    "заработать",
+    "важно",
+    "топ",
+    "ии"
+}
+
 
 # ============================================================
 # ПУТИ
@@ -61,9 +92,8 @@ PROJECTS = BASE / "projects"
 MUSIC = BASE / "music"
 VOICES = BASE / "voices"
 
-OUTPUT.mkdir(exist_ok=True)
-PROJECTS.mkdir(exist_ok=True)
-MUSIC.mkdir(exist_ok=True)
+for folder in [OUTPUT, PROJECTS, MUSIC]:
+    folder.mkdir(parents=True, exist_ok=True)
 
 
 def find_component(name):
@@ -76,6 +106,7 @@ def find_component(name):
 
     if getattr(sys, "frozen", False):
         internal = Path(getattr(sys, "_MEIPASS", BASE))
+
         candidates.extend([
             internal / name,
             internal / "piper" / name,
@@ -114,7 +145,7 @@ ESPEAK = find_espeak()
 
 
 # ============================================================
-# ЖУРНАЛ ОШИБОК
+# ОШИБКИ
 # ============================================================
 
 def write_error(error):
@@ -151,16 +182,12 @@ def run_command(command, input_data=None, env=None):
         )
 
         raise RuntimeError(
-            "Ошибка внешней программы:\n"
-            + error[-5000:]
+            f"Код завершения: {result.returncode}\n"
+            + error[-7000:]
         )
 
     return result
 
-
-# ============================================================
-# ПРОВЕРКА КОМПОНЕНТОВ
-# ============================================================
 
 def check_components():
     problems = []
@@ -175,19 +202,21 @@ def check_components():
         problems.append("Не найдена папка espeak-ng-data")
 
     for model in VOICE_MODELS.values():
-        if not (VOICES / model).exists():
-            problems.append("Нет модели: " + model)
+        path = VOICES / model
 
-        if not (VOICES / (model + ".json")).exists():
+        if not path.exists():
+            problems.append("Не найдена модель: " + model)
+
+        if not Path(str(path) + ".json").exists():
             problems.append(
-                "Нет настроек модели: " + model + ".json"
+                "Не найден JSON модели: " + model
             )
 
     return problems
 
 
 # ============================================================
-# РАБОТА С ТЕКСТОМ
+# ТЕКСТ
 # ============================================================
 
 def normalize_speech_text(text):
@@ -223,27 +252,17 @@ def split_script(text, max_length=105):
     if not text:
         return []
 
-    sentences = re.split(
-        r"(?<=[.!?])\s+",
-        text
-    )
-
     scenes = []
     current = ""
 
-    for sentence in sentences:
-        words = sentence.split()
+    for word in text.split():
+        candidate = (current + " " + word).strip()
 
-        for word in words:
-            candidate = (
-                current + " " + word
-            ).strip()
-
-            if len(candidate) > max_length and current:
-                scenes.append(current)
-                current = word
-            else:
-                current = candidate
+        if len(candidate) > max_length and current:
+            scenes.append(current)
+            current = word
+        else:
+            current = candidate
 
     if current:
         scenes.append(current)
@@ -254,26 +273,14 @@ def split_script(text, max_length=105):
 def split_subtitles(text, max_words=5):
     words = text.split()
 
-    if not words:
-        return []
+    return [
+        " ".join(words[i:i + max_words])
+        for i in range(0, len(words), max_words)
+    ]
 
-    result = []
-
-    for index in range(0, len(words), max_words):
-        phrase = " ".join(
-            words[index:index + max_words]
-        )
-        result.append(phrase)
-
-    return result
-
-
-# ============================================================
-# ШРИФТЫ
-# ============================================================
 
 def get_font(size, bold=True):
-    windows_fonts = Path("C:/Windows/Fonts")
+    fonts = Path("C:/Windows/Fonts")
 
     names = (
         ["arialbd.ttf", "segoeuib.ttf", "impact.ttf"]
@@ -282,51 +289,30 @@ def get_font(size, bold=True):
     )
 
     for name in names:
-        path = windows_fonts / name
+        path = fonts / name
 
         if path.exists():
-            return ImageFont.truetype(
-                str(path),
-                size
-            )
+            return ImageFont.truetype(str(path), size)
 
     return ImageFont.load_default()
 
 
-def fit_font(draw, text, max_width, start_size=58):
-    size = start_size
-
-    while size >= 22:
-        font = get_font(size)
-        box = draw.textbbox(
-            (0, 0),
-            text,
-            font=font
-        )
-
-        if box[2] - box[0] <= max_width:
-            return font
-
-        size -= 2
-
-    return get_font(22)
+def text_width(draw, text, font):
+    box = draw.textbbox((0, 0), text, font=font)
+    return box[2] - box[0]
 
 
 def wrap_lines(draw, text, font, max_width):
-    words = text.split()
     lines = []
     current = ""
 
-    for word in words:
+    for word in text.split():
         candidate = (current + " " + word).strip()
 
-        box = draw.textbbox(
-            (0, 0),
-            candidate,
-            font=font
-        )
-
-        if box[2] - box[0] > max_width and current:
+        if (
+            text_width(draw, candidate, font) > max_width
+            and current
+        ):
             lines.append(current)
             current = word
         else:
@@ -339,10 +325,10 @@ def wrap_lines(draw, text, font, max_width):
 
 
 # ============================================================
-# КИБЕРПАНК-ОФОРМЛЕНИЕ
+# ГРАФИКА
 # ============================================================
 
-def create_base_overlay(path, scene_number):
+def create_base_overlay(path, number):
     image = Image.new(
         "RGBA",
         (WIDTH, HEIGHT),
@@ -353,62 +339,66 @@ def create_base_overlay(path, scene_number):
 
     draw.rectangle(
         (0, 0, WIDTH, 105),
-        fill=(8, 11, 22, 220)
+        fill=(8, 11, 22, 225)
     )
 
     draw.rectangle(
-        (0, 100, WIDTH, 105),
+        (0, 101, WIDTH, 105),
         fill=(0, 217, 255, 255)
     )
 
     draw.text(
-        (35, 28),
+        (35, 25),
         "НЕЙРОХАК",
         font=get_font(43),
         fill=CYAN
     )
 
     draw.text(
-        (510, 45),
-        f"#{scene_number:02d}",
-        font=get_font(29),
+        (570, 40),
+        f"{number:02d}",
+        font=get_font(30),
         fill=PURPLE
     )
 
     draw.rectangle(
         (0, 1190, WIDTH, HEIGHT),
-        fill=(8, 11, 22, 220)
+        fill=(8, 11, 22, 230)
     )
 
     draw.text(
         (35, 1210),
-        "НЕЙРОСЕТИ  •  ТЕХНОЛОГИИ",
-        font=get_font(28),
+        "НЕЙРОСЕТИ • ТЕХНОЛОГИИ",
+        font=get_font(27),
         fill=WHITE
     )
 
     image.save(path)
 
 
-def create_subtitle_image(text, path):
-    image = Image.new(
-        "RGBA",
-        (WIDTH, HEIGHT),
-        (0, 0, 0, 0)
+# ============================================================
+# НОВЫЕ СУБТИТРЫ 4.1
+# ============================================================
+
+def is_accent_word(word):
+    clean = re.sub(
+        r"[^а-яёa-z0-9]",
+        "",
+        word.lower()
     )
 
+    return clean in ACCENT_WORDS
+
+
+def prepare_subtitle_lines(text, size):
+    image = Image.new("RGBA", (WIDTH, HEIGHT))
     draw = ImageDraw.Draw(image)
 
-    font = get_font(54)
-    lines = wrap_lines(
-        draw,
-        text.upper(),
-        font,
-        WIDTH - 100
-    )
+    font_size = SUBTITLE_SIZES.get(size, 54)
 
-    if len(lines) > 3:
-        font = get_font(42)
+    while font_size >= 28:
+        font = get_font(font_size)
+
         lines = wrap_lines(
             draw,
             text.upper(),
@@ -416,15 +406,79 @@ def create_subtitle_image(text, path):
             WIDTH - 100
         )
 
-    line_height = 77
+        if len(lines) <= 3:
+            return lines, font
+
+        font_size -= 4
+
+    return lines, font
+
+
+def draw_colored_line(draw, line, y, font, glow=False):
+    words = line.split()
+
+    if not words:
+        return
+
+    space = text_width(draw, " ", font)
+
+    widths = [
+        text_width(draw, word, font)
+        for word in words
+    ]
+
+    total = sum(widths) + space * (len(words) - 1)
+    x = (WIDTH - total) / 2
+
+    for index, word in enumerate(words):
+        accent = is_accent_word(word)
+
+        if glow:
+            color = (
+                (0, 217, 255, 190)
+                if accent else
+                (139, 92, 246, 150)
+            )
+
+            draw.text(
+                (int(x), y),
+                word,
+                font=font,
+                fill=color,
+                stroke_width=6,
+                stroke_fill=color
+            )
+
+        else:
+            color = CYAN if accent else WHITE
+
+            draw.text(
+                (int(x), y),
+                word,
+                font=font,
+                fill=color,
+                stroke_width=3,
+                stroke_fill=(8, 11, 22, 255)
+            )
+
+        x += widths[index] + space
+
+
+def create_subtitle_image(text, path, size):
+    image = Image.new(
+        "RGBA",
+        (WIDTH, HEIGHT),
+        (0, 0, 0, 0)
+    )
+
+    lines, font = prepare_subtitle_lines(text, size)
+
+    line_height = font.size + 22
     total_height = len(lines) * line_height
 
-    # Субтитры размещаются выше нижних кнопок VK.
-    y = 900 - total_height // 2
+    y = max(650, 905 - total_height // 2)
 
-    if y < 650:
-        y = 650
-
+    # Отдельный слой свечения.
     glow = Image.new(
         "RGBA",
         (WIDTH, HEIGHT),
@@ -433,77 +487,49 @@ def create_subtitle_image(text, path):
 
     glow_draw = ImageDraw.Draw(glow)
 
+    current_y = y
+
     for line in lines:
-        box = draw.textbbox(
-            (0, 0),
+        draw_colored_line(
+            glow_draw,
             line,
-            font=font
+            current_y,
+            font,
+            glow=True
         )
 
-        line_width = box[2] - box[0]
-        x = (WIDTH - line_width) // 2
-
-        glow_draw.text(
-            (x, y),
-            line,
-            font=font,
-            fill=(139, 92, 246, 210),
-            stroke_width=5,
-            stroke_fill=(139, 92, 246, 180)
-        )
-
-        y += line_height
+        current_y += line_height
 
     glow = glow.filter(
         ImageFilter.GaussianBlur(11)
     )
 
-    image = Image.alpha_composite(
-        image,
-        glow
-    )
+    image = Image.alpha_composite(image, glow)
 
     draw = ImageDraw.Draw(image)
 
-    y = 900 - total_height // 2
+    current_y = y
 
-    if y < 650:
-        y = 650
-
-    for index, line in enumerate(lines):
-        box = draw.textbbox(
-            (0, 0),
+    for line in lines:
+        draw_colored_line(
+            draw,
             line,
-            font=font
+            current_y,
+            font,
+            glow=False
         )
 
-        line_width = box[2] - box[0]
-        x = (WIDTH - line_width) // 2
-
-        color = CYAN if index == len(lines) - 1 else WHITE
-
-        draw.text(
-            (x, y),
-            line,
-            font=font,
-            fill=color,
-            stroke_width=3,
-            stroke_fill=(8, 11, 22, 255)
-        )
-
-        y += line_height
+        current_y += line_height
 
     image.save(path)
 
 
 # ============================================================
-# ОЗВУЧКА
+# PIPER
 # ============================================================
 
 def generate_voice(text, voice, speed, output_file):
     model = VOICES / VOICE_MODELS[voice]
-
-    clean_text = normalize_speech_text(text)
 
     env = os.environ.copy()
     env["ESPEAK_DATA_PATH"] = str(ESPEAK)
@@ -515,37 +541,34 @@ def generate_voice(text, voice, speed, output_file):
         "--length_scale", str(VOICE_SPEEDS[speed])
     ]
 
+    clean = normalize_speech_text(text)
+
     run_command(
         command,
-        input_data=(clean_text + "\n").encode("utf-8"),
+        input_data=(clean + "\n").encode("utf-8"),
         env=env
     )
 
     if not output_file.exists():
-        raise RuntimeError(
-            "Piper не создал файл озвучки."
-        )
+        raise RuntimeError("Piper не создал WAV-файл.")
 
 
 def audio_duration(path):
     with wave.open(str(path), "rb") as audio:
-        return (
-            audio.getnframes()
-            / audio.getframerate()
-        )
+        return audio.getnframes() / audio.getframerate()
 
 
 # ============================================================
-# СОЗДАНИЕ ВИДЕОСЦЕНЫ
+# ВИДЕОСЦЕНА
 # ============================================================
 
 def make_scene(
     material,
     voice_file,
     output_file,
-    base_overlay,
-    subtitle_files,
-    subtitle_enabled
+    overlay_file,
+    subtitles,
+    subtitles_enabled
 ):
     duration = audio_duration(voice_file) + 0.20
 
@@ -571,42 +594,55 @@ def make_scene(
     else:
         command += [
             "-f", "lavfi",
-            "-i", "color=c=0x080B16:s=720x1280:r=25"
+            "-i",
+            "color=c=0x080B16:s=720x1280:r=25"
         ]
 
     command += [
         "-i", str(voice_file),
         "-loop", "1",
-        "-i", str(base_overlay)
+        "-i", str(overlay_file)
     ]
 
-    for subtitle in subtitle_files:
+    for subtitle in subtitles:
         command += [
             "-loop", "1",
             "-i", str(subtitle)
         ]
 
-    # 0 — фон
-    # 1 — озвучка
-    # 2 — оформление
-    # 3+ — субтитры
-
     filters = [
-        "[0:v]scale=720:1280:"
+        "[0:v]"
+        "scale=720:1280:"
         "force_original_aspect_ratio=increase,"
         "crop=720:1280,"
         "setsar=1,"
         "format=yuv420p[bg]",
 
-        "[bg][2:v]overlay=0:0:shortest=1[v0]"
+        "[bg][2:v]"
+        "overlay=0:0:shortest=1[v0]"
     ]
 
     current = "v0"
 
-    if subtitle_enabled and subtitle_files:
-        phrase_duration = duration / len(subtitle_files)
+    if subtitles_enabled and subtitles:
+        # В 4.1 каждая фраза получает собственное
+        # временное окно и плавное проявление.
+        #
+        # Синхронизация остаётся приблизительной:
+        # длительность фраз распределяется
+        # относительно общей длительности WAV.
 
-        for index, subtitle in enumerate(subtitle_files):
+        weights = [
+            max(1, len(re.findall(r"\w+", path.stem)))
+            for path in subtitles
+        ]
+
+        # Файлы названы по номерам, поэтому для
+        # распределения используем равные интервалы.
+        # Это сохраняет предсказуемое поведение 4.0.
+        phrase_duration = duration / len(subtitles)
+
+        for index, subtitle in enumerate(subtitles):
             start = index * phrase_duration
             end = min(
                 duration,
@@ -614,13 +650,29 @@ def make_scene(
             )
 
             input_index = index + 3
+
+            subtitle_label = f"sub{index}"
             output_label = f"v{index + 1}"
 
-            # Каждый блок появляется в своё время.
+            # Плавное проявление прозрачного PNG
+            # в течение 0.22 секунды.
+            #
+            # setpts сдвигает начало субтитра
+            # к нужному времени сцены.
+
             filters.append(
-                f"[{current}][{input_index}:v]"
-                f"overlay=0:0:"
-                f"enable='between(t,{start:.3f},{end:.3f})'"
+                f"[{input_index}:v]"
+                "format=rgba,"
+                "fade=t=in:st=0:d=0.22:alpha=1,"
+                f"setpts=PTS-STARTPTS+{start:.3f}/TB"
+                f"[{subtitle_label}]"
+            )
+
+            filters.append(
+                f"[{current}][{subtitle_label}]"
+                "overlay=0:0:"
+                "eof_action=pass:"
+                f"enable='gte(t,{start:.3f})*lt(t,{end:.3f})'"
                 f"[{output_label}]"
             )
 
@@ -629,18 +681,23 @@ def make_scene(
     command += [
         "-filter_complex",
         ";".join(filters),
+
         "-map", f"[{current}]",
         "-map", "1:a:0",
+
         "-t", str(duration),
         "-r", str(FPS),
+
         "-c:v", "libx264",
         "-preset", "ultrafast",
         "-crf", "26",
         "-pix_fmt", "yuv420p",
+
         "-c:a", "aac",
         "-b:a", "160k",
         "-ar", "44100",
         "-ac", "2",
+
         "-movflags", "+faststart",
         str(output_file)
     ]
@@ -649,7 +706,7 @@ def make_scene(
 
 
 # ============================================================
-# ОБЪЕДИНЕНИЕ СЦЕН
+# ОБЪЕДИНЕНИЕ
 # ============================================================
 
 def combine_scenes(scene_files, output_file, workdir):
@@ -661,12 +718,9 @@ def combine_scenes(scene_files, output_file, workdir):
         encoding="utf-8"
     ) as file:
         for scene in scene_files:
-            # Сцены создаются во временной папке.
-            file.write(
-                "file '" + scene.name + "'\n"
-            )
+            file.write(f"file '{scene.name}'\n")
 
-    command = [
+    run_command([
         str(FFMPEG),
         "-y",
         "-f", "concat",
@@ -674,13 +728,11 @@ def combine_scenes(scene_files, output_file, workdir):
         "-i", str(concat_file),
         "-c", "copy",
         str(output_file)
-    ]
-
-    run_command(command)
+    ])
 
 
 # ============================================================
-# ФОНОВАЯ МУЗЫКА
+# МУЗЫКА
 # ============================================================
 
 def add_background_music(
@@ -693,18 +745,20 @@ def add_background_music(
         shutil.copy2(video_file, output_file)
         return
 
-    command = [
+    run_command([
         str(FFMPEG),
         "-y",
+
         "-i", str(video_file),
+
         "-stream_loop", "-1",
         "-i", str(music_file),
 
         "-filter_complex",
         (
             f"[1:a]volume={volume:.3f}[music];"
-            "[0:a][music]amix="
-            "inputs=2:"
+            "[0:a][music]"
+            "amix=inputs=2:"
             "duration=first:"
             "dropout_transition=0[a]"
         ),
@@ -715,17 +769,15 @@ def add_background_music(
         "-c:v", "copy",
         "-c:a", "aac",
         "-b:a", "160k",
-        "-movflags", "+faststart",
         "-shortest",
+        "-movflags", "+faststart",
 
         str(output_file)
-    ]
-
-    run_command(command)
+    ])
 
 
 # ============================================================
-# ПРИЛОЖЕНИЕ
+# ИНТЕРФЕЙС
 # ============================================================
 
 class NeuroHackStudio:
@@ -734,8 +786,8 @@ class NeuroHackStudio:
         self.root = root
 
         root.title(APP_NAME)
-        root.geometry("1050x780")
-        root.minsize(760, 550)
+        root.geometry("1080x800")
+        root.minsize(780, 560)
         root.configure(bg=BG)
 
         self.materials = []
@@ -745,17 +797,11 @@ class NeuroHackStudio:
         self.last_video = None
         self.busy = False
 
-        self.voice_var = tk.StringVar(
-            value="Мужской"
-        )
+        self.voice_var = tk.StringVar(value="Мужской")
+        self.speed_var = tk.StringVar(value="Нормальная")
 
-        self.speed_var = tk.StringVar(
-            value="Нормальная"
-        )
-
-        self.subtitle_var = tk.BooleanVar(
-            value=True
-        )
+        self.subtitle_var = tk.BooleanVar(value=True)
+        self.subtitle_size = tk.StringVar(value="Средние")
 
         self.mode_var = tk.StringVar(
             value="Автоматически"
@@ -765,9 +811,7 @@ class NeuroHackStudio:
             value="Без музыки"
         )
 
-        self.volume_var = tk.DoubleVar(
-            value=12
-        )
+        self.volume_var = tk.DoubleVar(value=12)
 
         self.status_var = tk.StringVar(
             value="Готов к работе"
@@ -807,11 +851,6 @@ class NeuroHackStudio:
             foreground=[("selected", WHITE)]
         )
 
-        style.configure(
-            "TCombobox",
-            padding=5
-        )
-
     # --------------------------------------------------------
 
     def button(self, parent, text, command, color=PURPLE):
@@ -844,10 +883,7 @@ class NeuroHackStudio:
     # --------------------------------------------------------
 
     def build_interface(self):
-        header = tk.Frame(
-            self.root,
-            bg=BG
-        )
+        header = tk.Frame(self.root, bg=BG)
 
         header.pack(
             fill="x",
@@ -857,7 +893,7 @@ class NeuroHackStudio:
 
         tk.Label(
             header,
-            text="⚡ НЕЙРОХАК СТУДИЯ 4.0",
+            text="⚡ НЕЙРОХАК СТУДИЯ 4.1",
             bg=BG,
             fg=CYAN,
             font=("Arial", 19, "bold")
@@ -865,43 +901,34 @@ class NeuroHackStudio:
 
         tk.Label(
             header,
-            text="VK КЛИПЫ • НЕЙРОСЕТИ • КИБЕРПАНК",
+            text="VK КЛИПЫ • КИБЕРПАНК • АНИМАЦИЯ",
             bg=BG,
             fg=GRAY,
             font=("Arial", 9)
         ).pack(anchor="w")
 
-        # Нижняя панель закрепляется ДО вкладок,
-        # чтобы кнопка создания всегда была видна.
+        # Закреплённая нижняя панель.
 
-        bottom = tk.Frame(
-            self.root,
-            bg=PANEL
-        )
+        bottom = tk.Frame(self.root, bg=PANEL)
 
         bottom.pack(
             side="bottom",
             fill="x"
         )
 
-        self.status_label = tk.Label(
+        tk.Label(
             bottom,
             textvariable=self.status_var,
             bg=PANEL,
             fg=CYAN,
             anchor="w"
-        )
-
-        self.status_label.pack(
+        ).pack(
             fill="x",
             padx=12,
             pady=(7, 0)
         )
 
-        controls = tk.Frame(
-            bottom,
-            bg=PANEL
-        )
+        controls = tk.Frame(bottom, bg=PANEL)
 
         controls.pack(
             fill="x",
@@ -938,9 +965,7 @@ class NeuroHackStudio:
             self.open_output
         ).pack(side="left", padx=5)
 
-        self.notebook = ttk.Notebook(
-            self.root
-        )
+        self.notebook = ttk.Notebook(self.root)
 
         self.notebook.pack(
             fill="both",
@@ -995,7 +1020,7 @@ class NeuroHackStudio:
         self.build_settings_tab()
 
     # ========================================================
-    # ВКЛАДКА СОЗДАНИЯ
+    # СОЗДАНИЕ
     # ========================================================
 
     def build_create_tab(self):
@@ -1010,41 +1035,58 @@ class NeuroHackStudio:
             pady=10
         )
 
-        self.label(
-            top,
-            "Голос:"
-        ).grid(row=0, column=0, padx=5, pady=6)
+        self.label(top, "Голос:").grid(
+            row=0,
+            column=0,
+            padx=5,
+            pady=6
+        )
 
         ttk.Combobox(
             top,
             textvariable=self.voice_var,
             values=list(VOICE_MODELS),
             state="readonly",
-            width=15
-        ).grid(row=0, column=1, padx=5)
+            width=13
+        ).grid(
+            row=0,
+            column=1,
+            padx=5
+        )
 
-        self.label(
-            top,
-            "Скорость:"
-        ).grid(row=0, column=2, padx=5)
+        self.label(top, "Скорость:").grid(
+            row=0,
+            column=2,
+            padx=5
+        )
 
         ttk.Combobox(
             top,
             textvariable=self.speed_var,
             values=list(VOICE_SPEEDS),
             state="readonly",
-            width=15
-        ).grid(row=0, column=3, padx=5)
+            width=13
+        ).grid(
+            row=0,
+            column=3,
+            padx=5
+        )
 
         self.button(
             top,
             "🔊 Проверить голос",
             self.test_voice
-        ).grid(row=0, column=4, padx=10)
+        ).grid(
+            row=0,
+            column=4,
+            padx=10
+        )
+
+        # Новые настройки 4.1.
 
         tk.Checkbutton(
             top,
-            text="Автоматические субтитры",
+            text="Субтитры ВКЛ",
             variable=self.subtitle_var,
             bg=BG,
             fg=CYAN,
@@ -1054,9 +1096,30 @@ class NeuroHackStudio:
         ).grid(
             row=1,
             column=0,
-            columnspan=3,
+            columnspan=2,
             sticky="w",
             pady=10
+        )
+
+        self.label(
+            top,
+            "Размер субтитров:"
+        ).grid(
+            row=1,
+            column=2,
+            padx=5
+        )
+
+        ttk.Combobox(
+            top,
+            textvariable=self.subtitle_size,
+            values=list(SUBTITLE_SIZES),
+            state="readonly",
+            width=13
+        ).grid(
+            row=1,
+            column=3,
+            padx=5
         )
 
         self.label(
@@ -1089,11 +1152,11 @@ class NeuroHackStudio:
 
         self.script_text.insert(
             "1.0",
-            "Привет! Это НЕЙРОХАК. "
-            "Сегодня расскажу о полезной технологии, "
-            "которая поможет тебе сэкономить время. "
-            "Подписывайся, чтобы узнавать больше "
-            "о нейросетях и технологиях!"
+            "Привет! Это Нейрохак. "
+            "Сегодня расскажу о бесплатной нейросети, "
+            "которая поможет тебе создавать видео "
+            "и экономить время. "
+            "Подписывайся на наше сообщество!"
         )
 
         actions = tk.Frame(
@@ -1109,13 +1172,13 @@ class NeuroHackStudio:
 
         self.button(
             actions,
-            "💾 Сохранить сценарий",
+            "💾 Сохранить проект",
             self.save_project
         ).pack(side="left", padx=4)
 
         self.button(
             actions,
-            "📂 Открыть сценарий",
+            "📂 Открыть проект",
             self.load_project
         ).pack(side="left", padx=4)
 
@@ -1184,7 +1247,7 @@ class NeuroHackStudio:
 
         self.label(
             mode_frame,
-            "Распределение материалов:"
+            "Распределение:"
         ).pack(side="left", padx=5)
 
         ttk.Combobox(
@@ -1206,7 +1269,7 @@ class NeuroHackStudio:
 
         self.label(
             self.tab_materials,
-            "Сцены (для ручного назначения выбери сцену):"
+            "Сцены:"
         ).pack(
             anchor="w",
             padx=16,
@@ -1230,7 +1293,7 @@ class NeuroHackStudio:
 
         self.button(
             self.tab_materials,
-            "📌 Назначить материал выбранной сцене",
+            "📌 Назначить материал сцене",
             self.assign_material
         ).pack(
             anchor="w",
@@ -1245,17 +1308,12 @@ class NeuroHackStudio:
     def build_music_tab(self):
         self.label(
             self.tab_music,
-            "🎵 Фоновая музыка для VK Клипов"
+            "🎵 Музыкальная библиотека"
         ).pack(
             anchor="w",
             padx=20,
             pady=20
         )
-
-        self.label(
-            self.tab_music,
-            "Выбери MP3 из библиотеки:"
-        ).pack(anchor="w", padx=20)
 
         self.music_combo = ttk.Combobox(
             self.tab_music,
@@ -1288,13 +1346,13 @@ class NeuroHackStudio:
 
         self.button(
             buttons,
-            "🔄 Обновить библиотеку",
+            "🔄 Обновить",
             self.refresh_music
         ).pack(side="left", padx=5)
 
         self.button(
             buttons,
-            "📁 Открыть папку music",
+            "📁 Папка music",
             lambda: os.startfile(str(MUSIC))
         ).pack(side="left", padx=5)
 
@@ -1321,20 +1379,14 @@ class NeuroHackStudio:
             highlightthickness=0
         ).pack(anchor="w", padx=20)
 
-        tk.Label(
+        self.label(
             self.tab_music,
-            text=(
-                "Рекомендуемая громкость: 10–15%.\n"
-                "Используй музыку, разрешённую "
-                "для публикации в VK."
-            ),
-            bg=BG,
-            fg=GRAY,
-            justify="left"
+            "Рекомендуется 10–15%. "
+            "Используй музыку с разрешением на публикацию."
         ).pack(
             anchor="w",
             padx=20,
-            pady=20
+            pady=15
         )
 
     # ========================================================
@@ -1343,16 +1395,19 @@ class NeuroHackStudio:
 
     def build_settings_tab(self):
         information = (
-            "НЕЙРОХАК СТУДИЯ 4.0\n\n"
-            "Формат: MP4\n"
+            "НЕЙРОХАК СТУДИЯ 4.1\n\n"
             "Разрешение: 720 × 1280\n"
             "Частота: 25 FPS\n"
             "Видеокодек: H.264\n"
-            "Озвучка: Piper\n"
-            "Субтитры: автоматические по фразам\n"
-            "Оформление: киберпанк\n\n"
-            "Для работы используется процессор.\n"
-            "Мощная видеокарта не требуется."
+            "Озвучка: Piper\n\n"
+            "Субтитры:\n"
+            "• Белый текст\n"
+            "• Голубые ключевые слова\n"
+            "• Фиолетовое свечение\n"
+            "• Плавное появление\n"
+            "• Три размера\n\n"
+            "Работает через процессор.\n"
+            "Платные API не требуются."
         )
 
         self.label(
@@ -1375,7 +1430,7 @@ class NeuroHackStudio:
 
         self.button(
             self.tab_settings,
-            "📁 Открыть папку программы",
+            "📁 Папка программы",
             lambda: os.startfile(str(BASE))
         ).pack(
             anchor="w",
@@ -1384,15 +1439,13 @@ class NeuroHackStudio:
         )
 
     # ========================================================
-    # КОПИРОВАНИЕ / ВСТАВКА
+    # БУФЕР ОБМЕНА
     # ========================================================
 
     def enable_clipboard(self):
         def handle_key(event):
             if not (event.state & 0x4):
                 return
-
-            keycode = event.keycode
 
             actions = {
                 67: "<<Copy>>",
@@ -1401,12 +1454,10 @@ class NeuroHackStudio:
                 65: "<<SelectAll>>"
             }
 
-            # На Windows эти аппаратные коды позволяют
-            # работать с русской раскладкой.
-            event_action = actions.get(keycode)
+            action = actions.get(event.keycode)
 
-            if event_action:
-                event.widget.event_generate(event_action)
+            if action:
+                event.widget.event_generate(action)
                 return "break"
 
         def show_menu(event):
@@ -1418,38 +1469,18 @@ class NeuroHackStudio:
             ):
                 return
 
-            menu = tk.Menu(
-                widget,
-                tearoff=0
-            )
+            menu = tk.Menu(widget, tearoff=0)
 
-            menu.add_command(
-                label="Вырезать",
-                command=lambda: widget.event_generate(
-                    "<<Cut>>"
+            for title, action in [
+                ("Вырезать", "<<Cut>>"),
+                ("Копировать", "<<Copy>>"),
+                ("Вставить", "<<Paste>>"),
+                ("Выделить всё", "<<SelectAll>>")
+            ]:
+                menu.add_command(
+                    label=title,
+                    command=lambda a=action: widget.event_generate(a)
                 )
-            )
-
-            menu.add_command(
-                label="Копировать",
-                command=lambda: widget.event_generate(
-                    "<<Copy>>"
-                )
-            )
-
-            menu.add_command(
-                label="Вставить",
-                command=lambda: widget.event_generate(
-                    "<<Paste>>"
-                )
-            )
-
-            menu.add_command(
-                label="Выделить всё",
-                command=lambda: widget.event_generate(
-                    "<<SelectAll>>"
-                )
-            )
 
             menu.tk_popup(
                 event.x_root,
@@ -1462,34 +1493,21 @@ class NeuroHackStudio:
             add="+"
         )
 
-        self.root.bind_class(
-            "Text",
-            "<Button-3>",
-            show_menu,
-            add="+"
-        )
-
-        self.root.bind_class(
-            "Entry",
-            "<Button-3>",
-            show_menu,
-            add="+"
-        )
-
-        self.root.bind_class(
-            "TEntry",
-            "<Button-3>",
-            show_menu,
-            add="+"
-        )
+        for widget_class in ["Text", "Entry", "TEntry"]:
+            self.root.bind_class(
+                widget_class,
+                "<Button-3>",
+                show_menu,
+                add="+"
+            )
 
     # ========================================================
-    # МАТЕРИАЛЫ
+    # ФАЙЛЫ
     # ========================================================
 
     def add_materials(self):
         files = filedialog.askopenfilenames(
-            title="Выбери фотографии и видео",
+            title="Добавить фото и видео",
             filetypes=[
                 (
                     "Фото и видео",
@@ -1516,6 +1534,7 @@ class NeuroHackStudio:
     def clear_materials(self):
         self.materials.clear()
         self.scene_assignments.clear()
+
         self.refresh_materials()
         self.refresh_scenes()
 
@@ -1540,17 +1559,12 @@ class NeuroHackStudio:
         )
 
     def refresh_scenes(self):
-        self.scene_list.delete(
-            0,
-            tk.END
-        )
+        self.scene_list.delete(0, tk.END)
 
         for index, scene in enumerate(
             self.prepared_scenes
         ):
-            material = self.scene_assignments.get(
-                index
-            )
+            material = self.scene_assignments.get(index)
 
             name = (
                 Path(material).name
@@ -1560,7 +1574,7 @@ class NeuroHackStudio:
 
             self.scene_list.insert(
                 tk.END,
-                f"{index + 1}. {scene[:55]}... [{name}]"
+                f"{index + 1}. {scene[:50]} [{name}]"
             )
 
     def assign_material(self):
@@ -1597,9 +1611,7 @@ class NeuroHackStudio:
     # ========================================================
 
     def refresh_music(self):
-        files = sorted(
-            MUSIC.glob("*.mp3")
-        )
+        files = sorted(MUSIC.glob("*.mp3"))
 
         self.music_files = {
             file.name: file
@@ -1613,16 +1625,12 @@ class NeuroHackStudio:
         self.music_combo["values"] = values
 
         if self.music_var.get() not in values:
-            self.music_var.set(
-                "Без музыки"
-            )
+            self.music_var.set("Без музыки")
 
     def add_music(self):
         files = filedialog.askopenfilenames(
             title="Добавить музыку",
-            filetypes=[
-                ("MP3", "*.mp3")
-            ]
+            filetypes=[("MP3", "*.mp3")]
         )
 
         for file in files:
@@ -1630,10 +1638,7 @@ class NeuroHackStudio:
             destination = MUSIC / source.name
 
             if source.resolve() != destination.resolve():
-                shutil.copy2(
-                    source,
-                    destination
-                )
+                shutil.copy2(source, destination)
 
         self.refresh_music()
 
@@ -1658,12 +1663,18 @@ class NeuroHackStudio:
                 "1.0",
                 tk.END
             ).strip(),
+
             "voice": self.voice_var.get(),
             "speed": self.speed_var.get(),
+
             "subtitles": self.subtitle_var.get(),
+            "subtitle_size": self.subtitle_size.get(),
+
             "materials": self.materials,
             "mode": self.mode_var.get(),
+
             "assignments": self.scene_assignments,
+
             "music": self.music_var.get(),
             "volume": self.volume_var.get()
         }
@@ -1704,10 +1715,7 @@ class NeuroHackStudio:
             ) as source:
                 data = json.load(source)
 
-            self.script_text.delete(
-                "1.0",
-                tk.END
-            )
+            self.script_text.delete("1.0", tk.END)
 
             self.script_text.insert(
                 "1.0",
@@ -1726,10 +1734,11 @@ class NeuroHackStudio:
                 data.get("subtitles", True)
             )
 
-            self.materials = data.get(
-                "materials",
-                []
+            self.subtitle_size.set(
+                data.get("subtitle_size", "Средние")
             )
+
+            self.materials = data.get("materials", [])
 
             self.mode_var.set(
                 data.get("mode", "Автоматически")
@@ -1741,9 +1750,10 @@ class NeuroHackStudio:
 
             self.refresh_music()
 
-            self.music_var.set(
-                data.get("music", "Без музыки")
-            )
+            music = data.get("music", "Без музыки")
+
+            if music in self.music_combo["values"]:
+                self.music_var.set(music)
 
             self.prepared_scenes = split_script(
                 data.get("script", "")
@@ -1773,7 +1783,7 @@ class NeuroHackStudio:
             )
 
     # ========================================================
-    # ПРОВЕРКА ГОЛОСА
+    # ОЗВУЧКА
     # ========================================================
 
     def test_voice(self):
@@ -1795,7 +1805,7 @@ class NeuroHackStudio:
         self.busy = True
 
         self.status_var.set(
-            "Генерируется проверочная озвучка..."
+            "Проверка озвучки..."
         )
 
         def worker():
@@ -1815,11 +1825,8 @@ class NeuroHackStudio:
                     lambda: os.startfile(str(file))
                 )
 
-                self.root.after(
-                    0,
-                    lambda: self.status_var.set(
-                        "Проверка озвучки завершена"
-                    )
+                self.update_status(
+                    "Проверка голоса завершена"
                 )
 
             except Exception as error:
@@ -1835,10 +1842,7 @@ class NeuroHackStudio:
                 )
 
             finally:
-                self.root.after(
-                    0,
-                    self.finish_task
-                )
+                self.root.after(0, self.finish_task)
 
         threading.Thread(
             target=worker,
@@ -1846,7 +1850,7 @@ class NeuroHackStudio:
         ).start()
 
     # ========================================================
-    # СОЗДАНИЕ КЛИПА
+    # СОЗДАНИЕ ВИДЕО
     # ========================================================
 
     def start_creation(self):
@@ -1857,7 +1861,7 @@ class NeuroHackStudio:
 
         if problems:
             messagebox.showerror(
-                "Не найдены компоненты",
+                "Компоненты",
                 "\n".join(problems)
             )
             return
@@ -1886,22 +1890,26 @@ class NeuroHackStudio:
             ):
                 messagebox.showwarning(
                     "Сцены изменились",
-                    "Сценарий изменён после назначения "
-                    "материалов. Подготовь сцены заново."
+                    "Подготовь сцены заново."
                 )
                 return
 
-        # Настройки фиксируются перед запуском потока.
         settings = {
             "scenes": scenes,
+
             "voice": self.voice_var.get(),
             "speed": self.speed_var.get(),
+
             "subtitles": self.subtitle_var.get(),
+            "subtitle_size": self.subtitle_size.get(),
+
             "materials": list(self.materials),
             "mode": self.mode_var.get(),
+
             "assignments": dict(
                 self.scene_assignments
             ),
+
             "music": self.music_var.get(),
             "volume": self.volume_var.get()
         }
@@ -1912,8 +1920,8 @@ class NeuroHackStudio:
             state="disabled"
         )
 
-        self.status_var.set(
-            "Подготовка к созданию клипа..."
+        self.update_status(
+            "Начинаем создание клипа..."
         )
 
         threading.Thread(
@@ -1935,15 +1943,15 @@ class NeuroHackStudio:
     def process_video(self, settings):
         try:
             timestamp = datetime.now().strftime(
-                "%Y%m%d_%H%M%S"
+                "%Y%m%d_%H%M%S_%f"
             )
 
             final_file = OUTPUT / (
-                f"NEUROHACK_{timestamp}.mp4"
+                f"NEUROHACK_41_{timestamp}.mp4"
             )
 
             with tempfile.TemporaryDirectory(
-                prefix="neurohack_"
+                prefix="neurohack41_"
             ) as temp:
                 workdir = Path(temp)
 
@@ -1992,7 +2000,8 @@ class NeuroHackStudio:
 
                             create_subtitle_image(
                                 phrase,
-                                subtitle_file
+                                subtitle_file,
+                                settings["subtitle_size"]
                             )
 
                             subtitle_files.append(
@@ -2020,7 +2029,8 @@ class NeuroHackStudio:
                     )
 
                     self.update_status(
-                        f"Сцена {number}/{len(scenes)}: видео"
+                        f"Сцена {number}/{len(scenes)}: "
+                        "анимация и видео"
                     )
 
                     make_scene(
@@ -2032,17 +2042,13 @@ class NeuroHackStudio:
                         settings["subtitles"]
                     )
 
-                    scene_files.append(
-                        scene_file
-                    )
+                    scene_files.append(scene_file)
 
                 self.update_status(
                     "Объединение сцен..."
                 )
 
-                combined_file = workdir / (
-                    "combined.mp4"
-                )
+                combined_file = workdir / "combined.mp4"
 
                 combine_scenes(
                     scene_files,
@@ -2050,9 +2056,8 @@ class NeuroHackStudio:
                     workdir
                 )
 
-                music_name = settings["music"]
-
                 music_file = None
+                music_name = settings["music"]
 
                 if music_name != "Без музыки":
                     candidate = MUSIC / music_name
@@ -2088,7 +2093,6 @@ class NeuroHackStudio:
 
         except Exception as error:
             write_error(error)
-
             text = str(error)
 
             self.update_status(
@@ -2126,13 +2130,8 @@ class NeuroHackStudio:
     # ========================================================
 
     def preview_video(self):
-        if (
-            self.last_video
-            and self.last_video.exists()
-        ):
-            os.startfile(
-                str(self.last_video)
-            )
+        if self.last_video and self.last_video.exists():
+            os.startfile(str(self.last_video))
             return
 
         videos = sorted(
@@ -2142,9 +2141,7 @@ class NeuroHackStudio:
         )
 
         if videos:
-            os.startfile(
-                str(videos[0])
-            )
+            os.startfile(str(videos[0]))
         else:
             messagebox.showinfo(
                 "Просмотр",
@@ -2152,12 +2149,10 @@ class NeuroHackStudio:
             )
 
     def open_output(self):
-        os.startfile(
-            str(OUTPUT)
-        )
+        os.startfile(str(OUTPUT))
 
     # ========================================================
-    # КОМПОНЕНТЫ
+    # ПРОВЕРКА КОМПОНЕНТОВ
     # ========================================================
 
     def show_components(self):
@@ -2165,15 +2160,15 @@ class NeuroHackStudio:
 
         if problems:
             messagebox.showwarning(
-                "Проверка компонентов",
+                "Компоненты",
                 "\n".join(problems)
             )
         else:
             messagebox.showinfo(
-                "Проверка компонентов",
+                "Компоненты",
                 "✅ FFmpeg найден\n"
                 "✅ Piper найден\n"
-                "✅ Данные eSpeak найдены\n"
+                "✅ eSpeak найден\n"
                 "✅ Мужской голос найден\n"
                 "✅ Женский голос найден"
             )
@@ -2185,9 +2180,7 @@ class NeuroHackStudio:
 
 def main():
     root = tk.Tk()
-
     app = NeuroHackStudio(root)
-
     root.mainloop()
 
 

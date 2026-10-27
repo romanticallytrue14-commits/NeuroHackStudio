@@ -380,146 +380,411 @@ def create_base_overlay(path, number):
 # НОВЫЕ СУБТИТРЫ 4.1
 # ============================================================
 
-def is_accent_word(word):
-    clean = re.sub(
+# ============================================================
+# СУБТИТРЫ 4.1.1
+# ИСПРАВЛЕНИЕ РАЗМЕРОВ, ПОДСВЕТКИ И СВЕЧЕНИЯ
+# ============================================================
+
+SUBTITLE_SAFE_WIDTH = 580
+SUBTITLE_TOP = 690
+SUBTITLE_BOTTOM = 1040
+
+SUBTITLE_ACCENT = (0, 217, 255, 255)
+SUBTITLE_WHITE = (255, 255, 255, 255)
+SUBTITLE_OUTLINE = (5, 8, 20, 255)
+
+SUBTITLE_GLOW_PURPLE = (139, 92, 246, 220)
+SUBTITLE_GLOW_CYAN = (0, 217, 255, 230)
+
+
+def clean_subtitle_word(word):
+    return re.sub(
         r"[^а-яёa-z0-9]",
         "",
         word.lower()
     )
 
-    return clean in ACCENT_WORDS
+
+def is_accent_word(word):
+    return clean_subtitle_word(word) in ACCENT_WORDS
 
 
-def prepare_subtitle_lines(text, size):
-    image = Image.new("RGBA", (WIDTH, HEIGHT))
-    draw = ImageDraw.Draw(image)
+def choose_accent_words(text):
+    words = text.split()
 
-    font_size = SUBTITLE_SIZES.get(size, 54)
+    selected = set()
 
-    while font_size >= 28:
-        font = get_font(font_size)
+    for index, word in enumerate(words):
+        if is_accent_word(word):
+            selected.add(index)
 
-        lines = wrap_lines(
+    # Если ключевых слов нет, выделяем
+    # самое длинное подходящее слово.
+
+    if not selected and words:
+        candidates = []
+
+        for index, word in enumerate(words):
+            clean = clean_subtitle_word(word)
+
+            if len(clean) >= 4:
+                candidates.append(
+                    (len(clean), index)
+                )
+
+        if candidates:
+            candidates.sort(reverse=True)
+            selected.add(candidates[0][1])
+
+        else:
+            selected.add(0)
+
+    return selected
+
+
+def measure_text(draw, text, font):
+    if not text:
+        return 0
+
+    box = draw.textbbox(
+        (0, 0),
+        text,
+        font=font,
+        stroke_width=0
+    )
+
+    return box[2] - box[0]
+
+
+def split_subtitle_lines(draw, text, font):
+    words = text.split()
+
+    if not words:
+        return []
+
+    lines = []
+    current = []
+
+    for word in words:
+        candidate = current + [word]
+
+        candidate_text = " ".join(candidate)
+
+        width = measure_text(
             draw,
-            text.upper(),
-            font,
-            WIDTH - 100
+            candidate_text,
+            font
         )
 
-        if len(lines) <= 3:
-            return lines, font
+        if (
+            width > SUBTITLE_SAFE_WIDTH
+            and current
+        ):
+            lines.append(current)
+            current = [word]
 
-        font_size -= 4
+        else:
+            current = candidate
 
-    return lines, font
+    if current:
+        lines.append(current)
+
+    return lines
 
 
-def draw_colored_line(draw, line, y, font, glow=False):
-    words = line.split()
+def calculate_subtitle_layout(text, size):
+    test_image = Image.new(
+        "RGBA",
+        (WIDTH, HEIGHT),
+        (0, 0, 0, 0)
+    )
 
+    draw = ImageDraw.Draw(test_image)
+
+    requested_size = SUBTITLE_SIZES.get(
+        size,
+        54
+    )
+
+    # Шрифт уменьшается до тех пор,
+    # пока текст не поместится.
+
+    for font_size in range(
+        requested_size,
+        17,
+        -2
+    ):
+        font = get_font(font_size)
+
+        lines = split_subtitle_lines(
+            draw,
+            text,
+            font
+        )
+
+        if not lines:
+            return [], font, 0
+
+        line_height = int(font_size * 1.55)
+
+        total_height = (
+            len(lines) * line_height
+        )
+
+        maximum_width = 0
+
+        for line in lines:
+            width = measure_text(
+                draw,
+                " ".join(line),
+                font
+            )
+
+            maximum_width = max(
+                maximum_width,
+                width
+            )
+
+        fits_width = (
+            maximum_width <= SUBTITLE_SAFE_WIDTH
+        )
+
+        fits_height = (
+            total_height <=
+            SUBTITLE_BOTTOM - SUBTITLE_TOP
+        )
+
+        fits_lines = len(lines) <= 3
+
+        if (
+            fits_width
+            and fits_height
+            and fits_lines
+        ):
+            return (
+                lines,
+                font,
+                line_height
+            )
+
+    # Защита для очень длинных фраз.
+    font = get_font(18)
+
+    lines = split_subtitle_lines(
+        draw,
+        text,
+        font
+    )
+
+    return (
+        lines,
+        font,
+        30
+    )
+
+
+def draw_subtitle_line(
+    draw,
+    words,
+    y,
+    font,
+    accent_indexes,
+    global_offset,
+    glow=False
+):
     if not words:
         return
 
-    space = text_width(draw, " ", font)
+    space_width = measure_text(
+        draw,
+        " ",
+        font
+    )
 
-    widths = [
-        text_width(draw, word, font)
+    word_widths = [
+        measure_text(draw, word, font)
         for word in words
     ]
 
-    total = sum(widths) + space * (len(words) - 1)
-    x = (WIDTH - total) / 2
+    total_width = (
+        sum(word_widths)
+        + space_width * (len(words) - 1)
+    )
 
-    for index, word in enumerate(words):
-        accent = is_accent_word(word)
+    x = (WIDTH - total_width) / 2
+
+    for local_index, word in enumerate(words):
+        global_index = (
+            global_offset + local_index
+        )
+
+        accent = (
+            global_index in accent_indexes
+        )
 
         if glow:
-            color = (
-                (0, 217, 255, 190)
-                if accent else
-                (139, 92, 246, 150)
-            )
+            if accent:
+                color = SUBTITLE_GLOW_CYAN
+            else:
+                color = SUBTITLE_GLOW_PURPLE
 
             draw.text(
-                (int(x), y),
+                (round(x), y),
                 word,
                 font=font,
                 fill=color,
-                stroke_width=6,
+                stroke_width=7,
                 stroke_fill=color
             )
 
         else:
-            color = CYAN if accent else WHITE
+            color = (
+                SUBTITLE_ACCENT
+                if accent
+                else SUBTITLE_WHITE
+            )
 
             draw.text(
-                (int(x), y),
+                (round(x), y),
                 word,
                 font=font,
                 fill=color,
                 stroke_width=3,
-                stroke_fill=(8, 11, 22, 255)
+                stroke_fill=SUBTITLE_OUTLINE
             )
 
-        x += widths[index] + space
+        x += (
+            word_widths[local_index]
+            + space_width
+        )
 
 
 def create_subtitle_image(text, path, size):
+    text = re.sub(
+        r"\s+",
+        " ",
+        text.upper()
+    ).strip()
+
     image = Image.new(
         "RGBA",
         (WIDTH, HEIGHT),
         (0, 0, 0, 0)
     )
 
-    lines, font = prepare_subtitle_lines(text, size)
+    if not text:
+        image.save(path)
+        return
 
-    line_height = font.size + 22
-    total_height = len(lines) * line_height
+    lines, font, line_height = (
+        calculate_subtitle_layout(
+            text,
+            size
+        )
+    )
 
-    y = max(650, 905 - total_height // 2)
+    if not lines:
+        image.save(path)
+        return
 
-    # Отдельный слой свечения.
+    all_words = text.split()
+
+    accent_indexes = choose_accent_words(
+        text
+    )
+
+    total_height = (
+        len(lines) * line_height
+    )
+
+    # Центрируем субтитры в безопасной области.
+
+    center_y = (
+        SUBTITLE_TOP + SUBTITLE_BOTTOM
+    ) // 2
+
+    start_y = (
+        center_y - total_height // 2
+    )
+
+    start_y = max(
+        SUBTITLE_TOP,
+        start_y
+    )
+
+    # Слой неонового свечения.
+
     glow = Image.new(
         "RGBA",
         (WIDTH, HEIGHT),
         (0, 0, 0, 0)
     )
 
-    glow_draw = ImageDraw.Draw(glow)
+    glow_draw = ImageDraw.Draw(
+        glow
+    )
 
-    current_y = y
+    word_offset = 0
 
-    for line in lines:
-        draw_colored_line(
+    for line_index, line in enumerate(lines):
+        y = (
+            start_y
+            + line_index * line_height
+        )
+
+        draw_subtitle_line(
             glow_draw,
             line,
-            current_y,
+            y,
             font,
+            accent_indexes,
+            word_offset,
             glow=True
         )
 
-        current_y += line_height
+        word_offset += len(line)
 
     glow = glow.filter(
-        ImageFilter.GaussianBlur(11)
+        ImageFilter.GaussianBlur(13)
     )
 
-    image = Image.alpha_composite(image, glow)
+    # Усиливаем эффект свечения.
 
-    draw = ImageDraw.Draw(image)
+    image = Image.alpha_composite(
+        image,
+        glow
+    )
 
-    current_y = y
+    image = Image.alpha_composite(
+        image,
+        glow
+    )
 
-    for line in lines:
-        draw_colored_line(
+    # Основной белый и голубой текст.
+
+    draw = ImageDraw.Draw(
+        image
+    )
+
+    word_offset = 0
+
+    for line_index, line in enumerate(lines):
+        y = (
+            start_y
+            + line_index * line_height
+        )
+
+        draw_subtitle_line(
             draw,
             line,
-            current_y,
+            y,
             font,
+            accent_indexes,
+            word_offset,
             glow=False
         )
 
-        current_y += line_height
+        word_offset += len(line)
 
     image.save(path)
 

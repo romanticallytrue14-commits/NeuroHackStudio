@@ -3,6 +3,7 @@ import sys
 import re
 import json
 import wave
+import random
 import shutil
 import tempfile
 import subprocess
@@ -19,10 +20,10 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 
 # ============================================================
-# НЕЙРОХАК СТУДИЯ 4.1
+# НЕЙРОХАК СТУДИЯ 4.2
 # ============================================================
 
-APP_NAME = "НЕЙРОХАК СТУДИЯ 4.1"
+APP_NAME = "НЕЙРОХАК СТУДИЯ 4.2"
 
 WIDTH = 720
 HEIGHT = 1280
@@ -53,29 +54,18 @@ SUBTITLE_SIZES = {
 }
 
 ACCENT_WORDS = {
-    "нейросеть",
-    "нейросети",
-    "нейросетей",
-    "бесплатно",
-    "бесплатный",
-    "бесплатная",
-    "бесплатные",
-    "искусственный",
-    "интеллект",
-    "технологии",
-    "технология",
-    "секрет",
-    "лайфхак",
-    "лайфхаки",
-    "видео",
-    "время",
-    "деньги",
-    "заработок",
-    "заработать",
-    "важно",
-    "топ",
-    "ии"
+    "нейросеть", "нейросети", "нейросетей",
+    "бесплатно", "бесплатный", "бесплатная",
+    "бесплатные", "искусственный", "интеллект",
+    "технологии", "технология", "секрет",
+    "лайфхак", "лайфхаки", "видео", "время",
+    "деньги", "заработок", "заработать",
+    "важно", "топ", "ии"
 }
+
+SUBTITLE_SAFE_WIDTH = 580
+SUBTITLE_TOP = 690
+SUBTITLE_BOTTOM = 1040
 
 
 # ============================================================
@@ -106,7 +96,6 @@ def find_component(name):
 
     if getattr(sys, "frozen", False):
         internal = Path(getattr(sys, "_MEIPASS", BASE))
-
         candidates.extend([
             internal / name,
             internal / "piper" / name,
@@ -145,7 +134,7 @@ ESPEAK = find_espeak()
 
 
 # ============================================================
-# ОШИБКИ
+# ЖУРНАЛ ОШИБОК
 # ============================================================
 
 def write_error(error):
@@ -205,12 +194,10 @@ def check_components():
         path = VOICES / model
 
         if not path.exists():
-            problems.append("Не найдена модель: " + model)
+            problems.append("Нет модели: " + model)
 
         if not Path(str(path) + ".json").exists():
-            problems.append(
-                "Не найден JSON модели: " + model
-            )
+            problems.append("Нет JSON модели: " + model)
 
     return problems
 
@@ -279,6 +266,10 @@ def split_subtitles(text, max_words=5):
     ]
 
 
+# ============================================================
+# ШРИФТЫ
+# ============================================================
+
 def get_font(size, bold=True):
     fonts = Path("C:/Windows/Fonts")
 
@@ -297,35 +288,21 @@ def get_font(size, bold=True):
     return ImageFont.load_default()
 
 
-def text_width(draw, text, font):
-    box = draw.textbbox((0, 0), text, font=font)
+def measure_text(draw, text, font):
+    if not text:
+        return 0
+
+    box = draw.textbbox(
+        (0, 0),
+        text,
+        font=font
+    )
+
     return box[2] - box[0]
 
 
-def wrap_lines(draw, text, font, max_width):
-    lines = []
-    current = ""
-
-    for word in text.split():
-        candidate = (current + " " + word).strip()
-
-        if (
-            text_width(draw, candidate, font) > max_width
-            and current
-        ):
-            lines.append(current)
-            current = word
-        else:
-            current = candidate
-
-    if current:
-        lines.append(current)
-
-    return lines
-
-
 # ============================================================
-# ГРАФИКА
+# КИБЕРПАНК-ОФОРМЛЕНИЕ
 # ============================================================
 
 def create_base_overlay(path, number):
@@ -377,25 +354,8 @@ def create_base_overlay(path, number):
 
 
 # ============================================================
-# НОВЫЕ СУБТИТРЫ 4.1
-# ============================================================
-
-# ============================================================
 # СУБТИТРЫ 4.1.1
-# ИСПРАВЛЕНИЕ РАЗМЕРОВ, ПОДСВЕТКИ И СВЕЧЕНИЯ
 # ============================================================
-
-SUBTITLE_SAFE_WIDTH = 580
-SUBTITLE_TOP = 690
-SUBTITLE_BOTTOM = 1040
-
-SUBTITLE_ACCENT = (0, 217, 255, 255)
-SUBTITLE_WHITE = (255, 255, 255, 255)
-SUBTITLE_OUTLINE = (5, 8, 20, 255)
-
-SUBTITLE_GLOW_PURPLE = (139, 92, 246, 220)
-SUBTITLE_GLOW_CYAN = (0, 217, 255, 230)
-
 
 def clean_subtitle_word(word):
     return re.sub(
@@ -405,21 +365,13 @@ def clean_subtitle_word(word):
     )
 
 
-def is_accent_word(word):
-    return clean_subtitle_word(word) in ACCENT_WORDS
-
-
 def choose_accent_words(text):
     words = text.split()
-
     selected = set()
 
     for index, word in enumerate(words):
-        if is_accent_word(word):
+        if clean_subtitle_word(word) in ACCENT_WORDS:
             selected.add(index)
-
-    # Если ключевых слов нет, выделяем
-    # самое длинное подходящее слово.
 
     if not selected and words:
         candidates = []
@@ -435,25 +387,10 @@ def choose_accent_words(text):
         if candidates:
             candidates.sort(reverse=True)
             selected.add(candidates[0][1])
-
         else:
             selected.add(0)
 
     return selected
-
-
-def measure_text(draw, text, font):
-    if not text:
-        return 0
-
-    box = draw.textbbox(
-        (0, 0),
-        text,
-        font=font,
-        stroke_width=0
-    )
-
-    return box[2] - box[0]
 
 
 def split_subtitle_lines(draw, text, font):
@@ -468,21 +405,15 @@ def split_subtitle_lines(draw, text, font):
     for word in words:
         candidate = current + [word]
 
-        candidate_text = " ".join(candidate)
-
         width = measure_text(
             draw,
-            candidate_text,
+            " ".join(candidate),
             font
         )
 
-        if (
-            width > SUBTITLE_SAFE_WIDTH
-            and current
-        ):
+        if width > SUBTITLE_SAFE_WIDTH and current:
             lines.append(current)
             current = [word]
-
         else:
             current = candidate
 
@@ -493,21 +424,14 @@ def split_subtitle_lines(draw, text, font):
 
 
 def calculate_subtitle_layout(text, size):
-    test_image = Image.new(
+    image = Image.new(
         "RGBA",
-        (WIDTH, HEIGHT),
-        (0, 0, 0, 0)
+        (WIDTH, HEIGHT)
     )
 
-    draw = ImageDraw.Draw(test_image)
+    draw = ImageDraw.Draw(image)
 
-    requested_size = SUBTITLE_SIZES.get(
-        size,
-        54
-    )
-
-    # Шрифт уменьшается до тех пор,
-    # пока текст не поместится.
+    requested_size = SUBTITLE_SIZES.get(size, 54)
 
     for font_size in range(
         requested_size,
@@ -526,61 +450,28 @@ def calculate_subtitle_layout(text, size):
             return [], font, 0
 
         line_height = int(font_size * 1.55)
+        total_height = len(lines) * line_height
 
-        total_height = (
-            len(lines) * line_height
-        )
-
-        maximum_width = 0
-
-        for line in lines:
-            width = measure_text(
+        maximum_width = max(
+            measure_text(
                 draw,
                 " ".join(line),
                 font
             )
-
-            maximum_width = max(
-                maximum_width,
-                width
-            )
-
-        fits_width = (
-            maximum_width <= SUBTITLE_SAFE_WIDTH
+            for line in lines
         )
-
-        fits_height = (
-            total_height <=
-            SUBTITLE_BOTTOM - SUBTITLE_TOP
-        )
-
-        fits_lines = len(lines) <= 3
 
         if (
-            fits_width
-            and fits_height
-            and fits_lines
+            maximum_width <= SUBTITLE_SAFE_WIDTH
+            and total_height <= SUBTITLE_BOTTOM - SUBTITLE_TOP
+            and len(lines) <= 3
         ):
-            return (
-                lines,
-                font,
-                line_height
-            )
+            return lines, font, line_height
 
-    # Защита для очень длинных фраз.
     font = get_font(18)
+    lines = split_subtitle_lines(draw, text, font)
 
-    lines = split_subtitle_lines(
-        draw,
-        text,
-        font
-    )
-
-    return (
-        lines,
-        font,
-        30
-    )
+    return lines, font, 30
 
 
 def draw_subtitle_line(
@@ -595,38 +486,31 @@ def draw_subtitle_line(
     if not words:
         return
 
-    space_width = measure_text(
-        draw,
-        " ",
-        font
-    )
+    space_width = measure_text(draw, " ", font)
 
-    word_widths = [
+    widths = [
         measure_text(draw, word, font)
         for word in words
     ]
 
     total_width = (
-        sum(word_widths)
+        sum(widths)
         + space_width * (len(words) - 1)
     )
 
     x = (WIDTH - total_width) / 2
 
     for local_index, word in enumerate(words):
-        global_index = (
-            global_offset + local_index
-        )
-
         accent = (
-            global_index in accent_indexes
-        )
+            global_offset + local_index
+        ) in accent_indexes
 
         if glow:
-            if accent:
-                color = SUBTITLE_GLOW_CYAN
-            else:
-                color = SUBTITLE_GLOW_PURPLE
+            color = (
+                (0, 217, 255, 230)
+                if accent else
+                (139, 92, 246, 220)
+            )
 
             draw.text(
                 (round(x), y),
@@ -638,11 +522,7 @@ def draw_subtitle_line(
             )
 
         else:
-            color = (
-                SUBTITLE_ACCENT
-                if accent
-                else SUBTITLE_WHITE
-            )
+            color = CYAN if accent else WHITE
 
             draw.text(
                 (round(x), y),
@@ -650,13 +530,10 @@ def draw_subtitle_line(
                 font=font,
                 fill=color,
                 stroke_width=3,
-                stroke_fill=SUBTITLE_OUTLINE
+                stroke_fill=(5, 8, 20, 255)
             )
 
-        x += (
-            word_widths[local_index]
-            + space_width
-        )
+        x += widths[local_index] + space_width
 
 
 def create_subtitle_image(text, path, size):
@@ -677,42 +554,25 @@ def create_subtitle_image(text, path, size):
         return
 
     lines, font, line_height = (
-        calculate_subtitle_layout(
-            text,
-            size
-        )
+        calculate_subtitle_layout(text, size)
     )
 
     if not lines:
         image.save(path)
         return
 
-    all_words = text.split()
+    accent_indexes = choose_accent_words(text)
 
-    accent_indexes = choose_accent_words(
-        text
-    )
-
-    total_height = (
-        len(lines) * line_height
-    )
-
-    # Центрируем субтитры в безопасной области.
+    total_height = len(lines) * line_height
 
     center_y = (
         SUBTITLE_TOP + SUBTITLE_BOTTOM
     ) // 2
 
-    start_y = (
-        center_y - total_height // 2
-    )
-
     start_y = max(
         SUBTITLE_TOP,
-        start_y
+        center_y - total_height // 2
     )
-
-    # Слой неонового свечения.
 
     glow = Image.new(
         "RGBA",
@@ -720,77 +580,51 @@ def create_subtitle_image(text, path, size):
         (0, 0, 0, 0)
     )
 
-    glow_draw = ImageDraw.Draw(
-        glow
-    )
+    glow_draw = ImageDraw.Draw(glow)
 
-    word_offset = 0
+    offset = 0
 
-    for line_index, line in enumerate(lines):
-        y = (
-            start_y
-            + line_index * line_height
-        )
-
+    for index, line in enumerate(lines):
         draw_subtitle_line(
             glow_draw,
             line,
-            y,
+            start_y + index * line_height,
             font,
             accent_indexes,
-            word_offset,
+            offset,
             glow=True
         )
 
-        word_offset += len(line)
+        offset += len(line)
 
     glow = glow.filter(
         ImageFilter.GaussianBlur(13)
     )
 
-    # Усиливаем эффект свечения.
+    image = Image.alpha_composite(image, glow)
+    image = Image.alpha_composite(image, glow)
 
-    image = Image.alpha_composite(
-        image,
-        glow
-    )
+    draw = ImageDraw.Draw(image)
+    offset = 0
 
-    image = Image.alpha_composite(
-        image,
-        glow
-    )
-
-    # Основной белый и голубой текст.
-
-    draw = ImageDraw.Draw(
-        image
-    )
-
-    word_offset = 0
-
-    for line_index, line in enumerate(lines):
-        y = (
-            start_y
-            + line_index * line_height
-        )
-
+    for index, line in enumerate(lines):
         draw_subtitle_line(
             draw,
             line,
-            y,
+            start_y + index * line_height,
             font,
             accent_indexes,
-            word_offset,
+            offset,
             glow=False
         )
 
-        word_offset += len(line)
+        offset += len(line)
 
     image.save(path)
 
 
 # ============================================================
-# PIPER
+# ОЗВУЧКА PIPER
 # ============================================================
 
 def generate_voice(text, voice, speed, output_file):
@@ -824,7 +658,7 @@ def audio_duration(path):
 
 
 # ============================================================
-# ВИДЕОСЦЕНА
+# СОЗДАНИЕ ВИДЕОСЦЕНЫ
 # ============================================================
 
 def make_scene(
@@ -890,21 +724,6 @@ def make_scene(
     current = "v0"
 
     if subtitles_enabled and subtitles:
-        # В 4.1 каждая фраза получает собственное
-        # временное окно и плавное проявление.
-        #
-        # Синхронизация остаётся приблизительной:
-        # длительность фраз распределяется
-        # относительно общей длительности WAV.
-
-        weights = [
-            max(1, len(re.findall(r"\w+", path.stem)))
-            for path in subtitles
-        ]
-
-        # Файлы названы по номерам, поэтому для
-        # распределения используем равные интервалы.
-        # Это сохраняет предсказуемое поведение 4.0.
         phrase_duration = duration / len(subtitles)
 
         for index, subtitle in enumerate(subtitles):
@@ -918,12 +737,6 @@ def make_scene(
 
             subtitle_label = f"sub{index}"
             output_label = f"v{index + 1}"
-
-            # Плавное проявление прозрачного PNG
-            # в течение 0.22 секунды.
-            #
-            # setpts сдвигает начало субтитра
-            # к нужному времени сцены.
 
             filters.append(
                 f"[{input_index}:v]"
@@ -971,7 +784,7 @@ def make_scene(
 
 
 # ============================================================
-# ОБЪЕДИНЕНИЕ
+# ОБЪЕДИНЕНИЕ СЦЕН
 # ============================================================
 
 def combine_scenes(scene_files, output_file, workdir):
@@ -997,7 +810,7 @@ def combine_scenes(scene_files, output_file, workdir):
 
 
 # ============================================================
-# МУЗЫКА
+# ФОНОВАЯ МУЗЫКА
 # ============================================================
 
 def add_background_music(
@@ -1013,9 +826,7 @@ def add_background_music(
     run_command([
         str(FFMPEG),
         "-y",
-
         "-i", str(video_file),
-
         "-stream_loop", "-1",
         "-i", str(music_file),
 
@@ -1042,7 +853,133 @@ def add_background_music(
 
 
 # ============================================================
-# ИНТЕРФЕЙС
+# ПОМОЩНИК 4.2 — БЕСПЛАТНО И БЕЗ ИНТЕРНЕТА
+# ============================================================
+
+IDEA_TOPICS = [
+    "5 бесплатных нейросетей для работы",
+    "3 полезных сайта для учёбы",
+    "Как использовать ChatGPT",
+    "Нейросети для создания изображений",
+    "Бесплатные инструменты для монтажа видео",
+    "Как ускорить работу на компьютере",
+    "5 скрытых возможностей Windows",
+    "Нейросети для написания текстов",
+    "Как создавать презентации с помощью ИИ",
+    "Полезные расширения для браузера",
+    "Бесплатные сервисы для обработки фотографий",
+    "Как защитить свои данные в интернете",
+    "Лучшие бесплатные приложения для Windows",
+    "Как автоматизировать повседневные задачи",
+    "Нейросети для изучения английского языка",
+    "Полезные функции смартфона",
+    "Как создавать короткие видео",
+    "Бесплатные программы для записи экрана",
+    "Как быстро находить нужную информацию",
+    "5 цифровых лайфхаков на каждый день"
+]
+
+HOOKS = [
+    "Ты удивишься, насколько полезной может быть эта технология!",
+    "Большинство людей даже не знают об этой возможности!",
+    "Хочешь тратить меньше времени на повседневные задачи?",
+    "Вот идея, которую стоит попробовать уже сегодня!",
+    "Этот цифровой лайфхак может пригодиться каждому!"
+]
+
+BENEFITS = [
+    "Начни с простой задачи и проверь результат самостоятельно.",
+    "Сравни несколько бесплатных решений и выбери удобное.",
+    "Не загружай личные данные в незнакомые сервисы.",
+    "Перед использованием проверь ограничения бесплатной версии.",
+    "Сохрани полезный результат, чтобы вернуться к нему позже."
+]
+
+CALLS_TO_ACTION = [
+    "Подписывайся на Нейрохак, чтобы узнавать больше о технологиях!",
+    "Сохрани этот клип и подпишись на Нейрохак!",
+    "Больше полезных цифровых лайфхаков — в сообществе Нейрохак!"
+]
+
+
+def clean_topic(topic):
+    topic = re.sub(r"\s+", " ", topic).strip()
+
+    if not topic:
+        raise ValueError("Сначала введи тему клипа.")
+
+    return topic[:180]
+
+
+def generate_script(topic, duration="30–60 секунд"):
+    topic = clean_topic(topic)
+
+    hook = random.choice(HOOKS)
+    benefit = random.choice(BENEFITS)
+    ending = random.choice(CALLS_TO_ACTION)
+
+    if duration == "15–30 секунд":
+        return (
+            f"{hook} "
+            f"Сегодня наша тема — {topic}. "
+            f"{benefit} "
+            f"{ending}"
+        )
+
+    if duration == "60–90 секунд":
+        return (
+            f"{hook} "
+            f"Сегодня разбираем тему: {topic}. "
+            "Первый шаг — определись, какую задачу хочешь решить. "
+            "Второй шаг — найди подходящий инструмент "
+            "и изучи его бесплатные возможности. "
+            "Третий шаг — проверь результат на небольшом примере. "
+            f"{benefit} "
+            "Проверяй информацию, которую предлагают нейросети. "
+            f"{ending}"
+        )
+
+    return (
+        f"{hook} "
+        f"Сегодня поговорим про {topic}. "
+        "Для начала определи, какую задачу "
+        "хочешь решить с помощью этой технологии. "
+        "Затем попробуй бесплатные инструменты "
+        "и сравни полученные результаты. "
+        f"{benefit} "
+        f"{ending}"
+    )
+
+
+def generate_title(topic):
+    topic = clean_topic(topic)
+
+    return random.choice([
+        f"🔥 {topic} — полезный лайфхак!",
+        f"⚡ {topic}: что стоит знать?",
+        f"🤖 Разбираемся: {topic}",
+        f"🚀 {topic} — попробуй сам!"
+    ])
+
+
+def generate_description(topic):
+    topic = clean_topic(topic)
+
+    return (
+        f"Сегодня в НЕЙРОХАК разбираем: {topic}.\n\n"
+        "Полезные технологии, нейросети и цифровые лайфхаки.\n"
+        "Подписывайся, чтобы не пропустить новые ролики!\n\n"
+        "#нейрохак #нейросети #технологии #лайфхаки #ии"
+    )
+
+
+def generate_ideas(count=10):
+    count = min(max(int(count), 1), len(IDEA_TOPICS))
+    return random.sample(IDEA_TOPICS, count)
+
+
+# ============================================================
+# ГЛАВНОЕ ОКНО
 # ============================================================
 
 class NeuroHackStudio:
@@ -1061,6 +998,7 @@ class NeuroHackStudio:
 
         self.last_video = None
         self.busy = False
+        self.ai_script = ""
 
         self.voice_var = tk.StringVar(value="Мужской")
         self.speed_var = tk.StringVar(value="Нормальная")
@@ -1080,6 +1018,11 @@ class NeuroHackStudio:
 
         self.status_var = tk.StringVar(
             value="Готов к работе"
+        )
+
+        self.ai_topic = tk.StringVar()
+        self.ai_duration = tk.StringVar(
+            value="30–60 секунд"
         )
 
         self.setup_style()
@@ -1107,7 +1050,7 @@ class NeuroHackStudio:
             "TNotebook.Tab",
             background=PANEL,
             foreground=WHITE,
-            padding=(18, 12)
+            padding=(15, 12)
         )
 
         style.map(
@@ -1145,7 +1088,9 @@ class NeuroHackStudio:
             font=("Arial", 10)
         )
 
-    # --------------------------------------------------------
+    # ========================================================
+    # ИНТЕРФЕЙС
+    # ========================================================
 
     def build_interface(self):
         header = tk.Frame(self.root, bg=BG)
@@ -1158,7 +1103,7 @@ class NeuroHackStudio:
 
         tk.Label(
             header,
-            text="⚡ НЕЙРОХАК СТУДИЯ 4.1",
+            text="⚡ НЕЙРОХАК СТУДИЯ 4.2",
             bg=BG,
             fg=CYAN,
             font=("Arial", 19, "bold")
@@ -1166,20 +1111,16 @@ class NeuroHackStudio:
 
         tk.Label(
             header,
-            text="VK КЛИПЫ • КИБЕРПАНК • АНИМАЦИЯ",
+            text="VK КЛИПЫ • КИБЕРПАНК • АВТОМАТИЗАЦИЯ",
             bg=BG,
             fg=GRAY,
             font=("Arial", 9)
         ).pack(anchor="w")
 
-        # Закреплённая нижняя панель.
+        # Нижняя панель остаётся видимой.
 
         bottom = tk.Frame(self.root, bg=PANEL)
-
-        bottom.pack(
-            side="bottom",
-            fill="x"
-        )
+        bottom.pack(side="bottom", fill="x")
 
         tk.Label(
             bottom,
@@ -1239,29 +1180,20 @@ class NeuroHackStudio:
             pady=10
         )
 
-        self.tab_create = tk.Frame(
-            self.notebook,
-            bg=BG
-        )
-
-        self.tab_materials = tk.Frame(
-            self.notebook,
-            bg=BG
-        )
-
-        self.tab_music = tk.Frame(
-            self.notebook,
-            bg=BG
-        )
-
-        self.tab_settings = tk.Frame(
-            self.notebook,
-            bg=BG
-        )
+        self.tab_create = tk.Frame(self.notebook, bg=BG)
+        self.tab_ai = tk.Frame(self.notebook, bg=BG)
+        self.tab_materials = tk.Frame(self.notebook, bg=BG)
+        self.tab_music = tk.Frame(self.notebook, bg=BG)
+        self.tab_settings = tk.Frame(self.notebook, bg=BG)
 
         self.notebook.add(
             self.tab_create,
             text="Создание видео"
+        )
+
+        self.notebook.add(
+            self.tab_ai,
+            text="🤖 ИИ-ПОМОЩНИК"
         )
 
         self.notebook.add(
@@ -1280,19 +1212,17 @@ class NeuroHackStudio:
         )
 
         self.build_create_tab()
+        self.build_ai_tab()
         self.build_materials_tab()
         self.build_music_tab()
         self.build_settings_tab()
 
     # ========================================================
-    # СОЗДАНИЕ
+    # СОЗДАНИЕ ВИДЕО
     # ========================================================
 
     def build_create_tab(self):
-        top = tk.Frame(
-            self.tab_create,
-            bg=BG
-        )
+        top = tk.Frame(self.tab_create, bg=BG)
 
         top.pack(
             fill="x",
@@ -1301,10 +1231,7 @@ class NeuroHackStudio:
         )
 
         self.label(top, "Голос:").grid(
-            row=0,
-            column=0,
-            padx=5,
-            pady=6
+            row=0, column=0, padx=5, pady=6
         )
 
         ttk.Combobox(
@@ -1313,16 +1240,10 @@ class NeuroHackStudio:
             values=list(VOICE_MODELS),
             state="readonly",
             width=13
-        ).grid(
-            row=0,
-            column=1,
-            padx=5
-        )
+        ).grid(row=0, column=1, padx=5)
 
         self.label(top, "Скорость:").grid(
-            row=0,
-            column=2,
-            padx=5
+            row=0, column=2, padx=5
         )
 
         ttk.Combobox(
@@ -1331,23 +1252,13 @@ class NeuroHackStudio:
             values=list(VOICE_SPEEDS),
             state="readonly",
             width=13
-        ).grid(
-            row=0,
-            column=3,
-            padx=5
-        )
+        ).grid(row=0, column=3, padx=5)
 
         self.button(
             top,
             "🔊 Проверить голос",
             self.test_voice
-        ).grid(
-            row=0,
-            column=4,
-            padx=10
-        )
-
-        # Новые настройки 4.1.
+        ).grid(row=0, column=4, padx=10)
 
         tk.Checkbutton(
             top,
@@ -1369,11 +1280,7 @@ class NeuroHackStudio:
         self.label(
             top,
             "Размер субтитров:"
-        ).grid(
-            row=1,
-            column=2,
-            padx=5
-        )
+        ).grid(row=1, column=2, padx=5)
 
         ttk.Combobox(
             top,
@@ -1381,11 +1288,7 @@ class NeuroHackStudio:
             values=list(SUBTITLE_SIZES),
             state="readonly",
             width=13
-        ).grid(
-            row=1,
-            column=3,
-            padx=5
-        )
+        ).grid(row=1, column=3, padx=5)
 
         self.label(
             self.tab_create,
@@ -1419,8 +1322,7 @@ class NeuroHackStudio:
             "1.0",
             "Привет! Это Нейрохак. "
             "Сегодня расскажу о бесплатной нейросети, "
-            "которая поможет тебе создавать видео "
-            "и экономить время. "
+            "которая поможет тебе экономить время. "
             "Подписывайся на наше сообщество!"
         )
 
@@ -1454,14 +1356,178 @@ class NeuroHackStudio:
         ).pack(side="left", padx=4)
 
     # ========================================================
+    # НОВАЯ ВКЛАДКА ИИ-ПОМОЩНИК
+    # ========================================================
+
+    def build_ai_tab(self):
+        tk.Label(
+            self.tab_ai,
+            text="🤖 ПОМОЩНИК НЕЙРОХАК",
+            bg=BG,
+            fg=CYAN,
+            font=("Arial", 18, "bold")
+        ).pack(pady=12)
+
+        self.label(
+            self.tab_ai,
+            "Тема будущего VK Клипа:"
+        ).pack(anchor="w", padx=20)
+
+        self.ai_topic_entry = ttk.Entry(
+            self.tab_ai,
+            textvariable=self.ai_topic,
+            width=70
+        )
+
+        self.ai_topic_entry.pack(
+            fill="x",
+            padx=20,
+            pady=8
+        )
+
+        self.label(
+            self.tab_ai,
+            "Продолжительность:"
+        ).pack(anchor="w", padx=20)
+
+        ttk.Combobox(
+            self.tab_ai,
+            textvariable=self.ai_duration,
+            values=[
+                "15–30 секунд",
+                "30–60 секунд",
+                "60–90 секунд"
+            ],
+            state="readonly",
+            width=25
+        ).pack(
+            anchor="w",
+            padx=20,
+            pady=8
+        )
+
+        buttons = tk.Frame(self.tab_ai, bg=BG)
+
+        buttons.pack(
+            fill="x",
+            padx=15,
+            pady=5
+        )
+
+        self.button(
+            buttons,
+            "⚡ СОЗДАТЬ СЦЕНАРИЙ",
+            self.ai_generate,
+            CYAN
+        ).pack(side="left", padx=5)
+
+        self.button(
+            buttons,
+            "💡 СОЗДАТЬ 10 ИДЕЙ",
+            self.ai_ideas
+        ).pack(side="left", padx=5)
+
+        self.label(
+            self.tab_ai,
+            "Результат:"
+        ).pack(anchor="w", padx=20, pady=(8, 0))
+
+        self.ai_result = tk.Text(
+            self.tab_ai,
+            bg=PANEL,
+            fg=WHITE,
+            insertbackground=CYAN,
+            selectbackground=PURPLE,
+            wrap="word",
+            font=("Arial", 11),
+            undo=True
+        )
+
+        self.ai_result.pack(
+            fill="both",
+            expand=True,
+            padx=20,
+            pady=8
+        )
+
+        self.button(
+            self.tab_ai,
+            "🎬 ПЕРЕДАТЬ СЦЕНАРИЙ В СОЗДАНИЕ ВИДЕО",
+            self.ai_to_video
+        ).pack(
+            anchor="w",
+            padx=20,
+            pady=(3, 12)
+        )
+
+    # --------------------------------------------------------
+
+    def ai_generate(self):
+        try:
+            topic = self.ai_topic.get().strip()
+
+            script = generate_script(
+                topic,
+                self.ai_duration.get()
+            )
+
+            title = generate_title(topic)
+            description = generate_description(topic)
+
+            self.ai_script = script
+
+            result = (
+                f"ЗАГОЛОВОК:\n{title}\n\n"
+                f"СЦЕНАРИЙ:\n{script}\n\n"
+                f"ОПИСАНИЕ:\n{description}"
+            )
+
+            self.ai_result.delete("1.0", tk.END)
+            self.ai_result.insert("1.0", result)
+
+        except Exception as error:
+            messagebox.showerror(
+                "Помощник",
+                str(error)
+            )
+
+    # --------------------------------------------------------
+
+    def ai_to_video(self):
+        if not self.ai_script:
+            messagebox.showwarning(
+                "Помощник",
+                "Сначала создай сценарий."
+            )
+            return
+
+        self.script_text.delete("1.0", tk.END)
+        self.script_text.insert(
+            "1.0",
+            self.ai_script
+        )
+
+        self.notebook.select(self.tab_create)
+
+    # --------------------------------------------------------
+
+    def ai_ideas(self):
+        ideas = generate_ideas(10)
+
+        result = "10 ИДЕЙ ДЛЯ VK КЛИПОВ:\n\n"
+
+        for index, idea in enumerate(ideas, 1):
+            result += f"{index}. {idea}\n"
+
+        self.ai_result.delete("1.0", tk.END)
+        self.ai_result.insert("1.0", result)
+
+    # ========================================================
     # МАТЕРИАЛЫ
     # ========================================================
 
     def build_materials_tab(self):
-        top = tk.Frame(
-            self.tab_materials,
-            bg=BG
-        )
+        top = tk.Frame(self.tab_materials, bg=BG)
 
         top.pack(
             fill="x",
@@ -1505,10 +1571,7 @@ class NeuroHackStudio:
             bg=BG
         )
 
-        mode_frame.pack(
-            fill="x",
-            padx=15
-        )
+        mode_frame.pack(fill="x", padx=15)
 
         self.label(
             mode_frame,
@@ -1518,10 +1581,7 @@ class NeuroHackStudio:
         ttk.Combobox(
             mode_frame,
             textvariable=self.mode_var,
-            values=[
-                "Автоматически",
-                "Вручную"
-            ],
+            values=["Автоматически", "Вручную"],
             state="readonly",
             width=20
         ).pack(side="left", padx=5)
@@ -1593,15 +1653,9 @@ class NeuroHackStudio:
             pady=10
         )
 
-        buttons = tk.Frame(
-            self.tab_music,
-            bg=BG
-        )
+        buttons = tk.Frame(self.tab_music, bg=BG)
 
-        buttons.pack(
-            anchor="w",
-            padx=15
-        )
+        buttons.pack(anchor="w", padx=15)
 
         self.button(
             buttons,
@@ -1660,19 +1714,16 @@ class NeuroHackStudio:
 
     def build_settings_tab(self):
         information = (
-            "НЕЙРОХАК СТУДИЯ 4.1\n\n"
+            "НЕЙРОХАК СТУДИЯ 4.2\n\n"
             "Разрешение: 720 × 1280\n"
             "Частота: 25 FPS\n"
             "Видеокодек: H.264\n"
             "Озвучка: Piper\n\n"
-            "Субтитры:\n"
-            "• Белый текст\n"
-            "• Голубые ключевые слова\n"
-            "• Фиолетовое свечение\n"
-            "• Плавное появление\n"
-            "• Три размера\n\n"
-            "Работает через процессор.\n"
-            "Платные API не требуются."
+            "Субтитры: белые, с голубыми акцентами\n"
+            "Музыка: MP3\n"
+            "Сценарии: встроенный помощник\n\n"
+            "Помощник работает по шаблонам,\n"
+            "без интернета и платных API."
         )
 
         self.label(
@@ -1688,10 +1739,7 @@ class NeuroHackStudio:
             self.tab_settings,
             "🔍 Проверить компоненты",
             self.show_components
-        ).pack(
-            anchor="w",
-            padx=20
-        )
+        ).pack(anchor="w", padx=20)
 
         self.button(
             self.tab_settings,
@@ -1704,7 +1752,7 @@ class NeuroHackStudio:
         )
 
     # ========================================================
-    # БУФЕР ОБМЕНА
+    # КОПИРОВАНИЕ И ВСТАВКА
     # ========================================================
 
     def enable_clipboard(self):
@@ -1767,7 +1815,7 @@ class NeuroHackStudio:
             )
 
     # ========================================================
-    # ФАЙЛЫ
+    # МАТЕРИАЛЫ
     # ========================================================
 
     def add_materials(self):
@@ -1908,7 +1956,7 @@ class NeuroHackStudio:
         self.refresh_music()
 
     # ========================================================
-    # ПРОЕКТЫ
+    # СОХРАНЕНИЕ ПРОЕКТА
     # ========================================================
 
     def save_project(self):
@@ -1960,6 +2008,10 @@ class NeuroHackStudio:
             "Проект",
             "Проект сохранён."
         )
+
+    # ========================================================
+    # ОТКРЫТИЕ ПРОЕКТА
+    # ========================================================
 
     def load_project(self):
         file = filedialog.askopenfilename(
@@ -2048,7 +2100,7 @@ class NeuroHackStudio:
             )
 
     # ========================================================
-    # ОЗВУЧКА
+    # ПРОВЕРКА ГОЛОСА
     # ========================================================
 
     def test_voice(self):
@@ -2107,7 +2159,10 @@ class NeuroHackStudio:
                 )
 
             finally:
-                self.root.after(0, self.finish_task)
+                self.root.after(
+                    0,
+                    self.finish_task
+                )
 
         threading.Thread(
             target=worker,
@@ -2115,7 +2170,7 @@ class NeuroHackStudio:
         ).start()
 
     # ========================================================
-    # СОЗДАНИЕ ВИДЕО
+    # СОЗДАНИЕ КЛИПА
     # ========================================================
 
     def start_creation(self):
@@ -2212,11 +2267,11 @@ class NeuroHackStudio:
             )
 
             final_file = OUTPUT / (
-                f"NEUROHACK_41_{timestamp}.mp4"
+                f"NEUROHACK_42_{timestamp}.mp4"
             )
 
             with tempfile.TemporaryDirectory(
-                prefix="neurohack41_"
+                prefix="neurohack42_"
             ) as temp:
                 workdir = Path(temp)
 
@@ -2294,8 +2349,7 @@ class NeuroHackStudio:
                     )
 
                     self.update_status(
-                        f"Сцена {number}/{len(scenes)}: "
-                        "анимация и видео"
+                        f"Сцена {number}/{len(scenes)}: видео"
                     )
 
                     make_scene(
@@ -2445,7 +2499,7 @@ class NeuroHackStudio:
 
 def main():
     root = tk.Tk()
-    app = NeuroHackStudio(root)
+    NeuroHackStudio(root)
     root.mainloop()
 
 

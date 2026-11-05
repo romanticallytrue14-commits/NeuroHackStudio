@@ -19,4 +19,4 @@
 
 ## Скачать Windows-сборку
 
-Открой [последние сборки в GitHub Actions](https://github.com/romanticallytrue14-commits/NeuroHackStudio/actions/workflows/build.yml), выбери самый свежий успешный запуск **Build NeuroHack Studio 4.2** и скачай артефакт **NeuroHackStudio-4.2**. Распакуй архив и запусти `NeuroHackStudio.exe` из распакованной папки. Артефакты Actions хранятся 90 дней; сборка запускается автоматически при push в `main` и ветки `arena/**`.
+Открой [последние сборки в GitHub Actions](https://github.com/romanticallytrue14-commits/NeuroHackStudio/actions/workflows/build.yml), выбери самый свежий успешный запуск и скачай артефакт **NeuroHackStudio-4.2**. Распакуй архив и запусти `NeuroHackStudio.exe` из распакованной папки. Артефакты Actions хранятся 90 дней; сборка запускается автоматически при push в `main` и ветки `arena/**`.

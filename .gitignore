@@ -1,0 +1,13 @@
+# Generated media and local projects
+/output/
+/projects/*.json
+/projects/*.tmp
+/music/*.mp3
+/error_log.txt
+
+# Python / PyInstaller
+__pycache__/
+*.py[cod]
+/build/
+/dist/
+*.spec

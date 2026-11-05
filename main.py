@@ -10,6 +10,7 @@ import subprocess
 import threading
 import traceback
 
+from difflib import SequenceMatcher
 from pathlib import Path
 from datetime import datetime
 
@@ -31,6 +32,11 @@ FPS = 25
 
 BG = "#080B16"
 PANEL = "#111827"
+SURFACE = "#101827"
+SURFACE_2 = "#172337"
+EDITOR_BG = "#0B1220"
+BORDER = "#26354A"
+MUTED = "#94A3B8"
 CYAN = "#00D9FF"
 PURPLE = "#8B5CF6"
 WHITE = "#FFFFFF"
@@ -81,6 +87,7 @@ OUTPUT = BASE / "output"
 PROJECTS = BASE / "projects"
 MUSIC = BASE / "music"
 VOICES = BASE / "voices"
+AUTOSAVE_PATH = PROJECTS / "autosave.json"
 
 for folder in [OUTPUT, PROJECTS, MUSIC]:
     folder.mkdir(parents=True, exist_ok=True)
@@ -149,27 +156,79 @@ def write_error(error):
         file.write(traceback.format_exc())
 
 
-def run_command(command, input_data=None, env=None):
-    result = subprocess.run(
-        [str(item) for item in command],
-        input=input_data,
+class TaskCancelled(Exception):
+    """Raised when the user cancels a background generation task."""
+
+
+def open_with_default_app(path):
+    """Open a file or folder with the operating system's default application."""
+    target = str(Path(path).expanduser())
+
+    if os.name == "nt" and hasattr(os, "startfile"):
+        os.startfile(target)
+        return
+
+    opener = "open" if sys.platform == "darwin" else "xdg-open"
+
+    try:
+        subprocess.Popen(
+            [opener, target],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+    except OSError as error:
+        raise RuntimeError(f"Не удалось открыть: {target}\n{error}") from error
+
+
+def run_command(command, input_data=None, env=None, cancel_event=None):
+    command = [str(item) for item in command]
+
+    if cancel_event and cancel_event.is_set():
+        raise TaskCancelled("Задача отменена пользователем.")
+
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE if input_data is not None else None,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=str(BASE),
         env=env,
-        creationflags=getattr(
-            subprocess,
-            "CREATE_NO_WINDOW",
-            0
-        )
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
     )
 
-    if result.returncode != 0:
-        error = result.stderr.decode(
-            "utf-8",
-            errors="replace"
-        )
+    pending_input = input_data
+    while True:
+        try:
+            stdout, stderr = process.communicate(
+                input=pending_input,
+                timeout=0.25
+            )
+            break
+        except subprocess.TimeoutExpired:
+            pending_input = None
+            if cancel_event and cancel_event.is_set():
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
+                try:
+                    process.communicate(timeout=3)
+                except subprocess.TimeoutExpired:
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+                    process.communicate()
+                raise TaskCancelled("Задача отменена пользователем.")
 
+    if cancel_event and cancel_event.is_set():
+        raise TaskCancelled("Задача отменена пользователем.")
+
+    result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+    if result.returncode != 0:
+        error = result.stderr.decode("utf-8", errors="replace")
         raise RuntimeError(
             f"Код завершения: {result.returncode}\n"
             + error[-7000:]
@@ -257,6 +316,16 @@ def split_script(text, max_length=105):
     return scenes
 
 
+def russian_plural(number, one, few, many):
+    remainder_10 = abs(number) % 10
+    remainder_100 = abs(number) % 100
+    if remainder_10 == 1 and remainder_100 != 11:
+        return one
+    if 2 <= remainder_10 <= 4 and not 12 <= remainder_100 <= 14:
+        return few
+    return many
+
+
 def split_subtitles(text, max_words=5):
     words = text.split()
 
@@ -264,6 +333,25 @@ def split_subtitles(text, max_words=5):
         " ".join(words[i:i + max_words])
         for i in range(0, len(words), max_words)
     ]
+
+
+def format_srt_timestamp(seconds):
+    milliseconds = max(0, int(round(seconds * 1000)))
+    hours, remainder = divmod(milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    whole_seconds, milliseconds = divmod(remainder, 1000)
+    return f"{hours:02}:{minutes:02}:{whole_seconds:02},{milliseconds:03}"
+
+
+def write_srt(path, captions):
+    with open(path, "w", encoding="utf-8") as output:
+        for index, (start, end, text) in enumerate(captions, 1):
+            output.write(f"{index}\n")
+            output.write(
+                f"{format_srt_timestamp(start)} --> "
+                f"{format_srt_timestamp(end)}\n"
+            )
+            output.write(text.strip() + "\n\n")
 
 
 # ============================================================
@@ -627,7 +715,7 @@ def create_subtitle_image(text, path, size):
 # ОЗВУЧКА PIPER
 # ============================================================
 
-def generate_voice(text, voice, speed, output_file):
+def generate_voice(text, voice, speed, output_file, cancel_event=None):
     model = VOICES / VOICE_MODELS[voice]
 
     env = os.environ.copy()
@@ -645,7 +733,8 @@ def generate_voice(text, voice, speed, output_file):
     run_command(
         command,
         input_data=(clean + "\n").encode("utf-8"),
-        env=env
+        env=env,
+        cancel_event=cancel_event
     )
 
     if not output_file.exists():
@@ -667,7 +756,8 @@ def make_scene(
     output_file,
     overlay_file,
     subtitles,
-    subtitles_enabled
+    subtitles_enabled,
+    cancel_event=None
 ):
     duration = audio_duration(voice_file) + 0.20
 
@@ -780,14 +870,14 @@ def make_scene(
         str(output_file)
     ]
 
-    run_command(command)
+    run_command(command, cancel_event=cancel_event)
 
 
 # ============================================================
 # ОБЪЕДИНЕНИЕ СЦЕН
 # ============================================================
 
-def combine_scenes(scene_files, output_file, workdir):
+def combine_scenes(scene_files, output_file, workdir, cancel_event=None):
     concat_file = workdir / "concat.txt"
 
     with open(
@@ -806,7 +896,7 @@ def combine_scenes(scene_files, output_file, workdir):
         "-i", str(concat_file),
         "-c", "copy",
         str(output_file)
-    ])
+    ], cancel_event=cancel_event)
 
 
 # ============================================================
@@ -817,10 +907,16 @@ def add_background_music(
     video_file,
     music_file,
     volume,
-    output_file
+    output_file,
+    cancel_event=None
 ):
+    if cancel_event and cancel_event.is_set():
+        raise TaskCancelled("Задача отменена пользователем.")
+
     if not music_file:
         shutil.copy2(video_file, output_file)
+        if cancel_event and cancel_event.is_set():
+            raise TaskCancelled("Задача отменена пользователем.")
         return
 
     run_command([
@@ -849,7 +945,7 @@ def add_background_music(
         "-movflags", "+faststart",
 
         str(output_file)
-    ])
+    ], cancel_event=cancel_event)
 
 
 # ============================================================
@@ -984,51 +1080,95 @@ def generate_ideas(count=10):
 
 class NeuroHackStudio:
 
+    PAGE_META = {
+        "create": ("Создание клипа", "Соберите вертикальное видео из сценария, озвучки и материалов."),
+        "ai": ("ИИ-помощник", "Идеи, сценарии и описание для следующего ролика."),
+        "materials": ("Материалы и сцены", "Управляйте исходниками и распределением по сценам."),
+        "music": ("Музыкальная библиотека", "Добавьте фоновую музыку и настройте её громкость."),
+        "library": ("Проекты и результаты", "Недавние клипы, сохранённые проекты и восстановление работы."),
+        "settings": ("Настройки", "Параметры проекта и проверка компонентов."),
+    }
+
     def __init__(self, root):
         self.root = root
 
         root.title(APP_NAME)
-        root.geometry("1080x800")
-        root.minsize(780, 560)
+        screen_width = root.winfo_screenwidth()
+        screen_height = root.winfo_screenheight()
+        window_width = min(1240, max(850, screen_width - 80))
+        window_height = min(820, max(600, screen_height - 80))
+        root.geometry(f"{window_width}x{window_height}")
+        root.minsize(850, 600)
         root.configure(bg=BG)
+        root.option_add("*Font", ("Arial", 10))
 
         self.materials = []
         self.scene_assignments = {}
         self.prepared_scenes = []
 
         self.last_video = None
+        self.last_srt = None
         self.busy = False
         self.ai_script = ""
+        self.cancel_event = threading.Event()
+        self.current_project_file = None
+        self.is_dirty = False
+        self._loading_project = False
+        self._close_when_idle = False
+        self._autosave_after = None
+        self._preview_after = None
+        self.output_video_files = []
+        self.project_file_paths = []
 
         self.voice_var = tk.StringVar(value="Мужской")
         self.speed_var = tk.StringVar(value="Нормальная")
 
         self.subtitle_var = tk.BooleanVar(value=True)
+        self.export_srt_var = tk.BooleanVar(value=True)
         self.subtitle_size = tk.StringVar(value="Средние")
 
-        self.mode_var = tk.StringVar(
-            value="Автоматически"
-        )
-
-        self.music_var = tk.StringVar(
-            value="Без музыки"
-        )
-
+        self.mode_var = tk.StringVar(value="Автоматически")
+        self.music_var = tk.StringVar(value="Без музыки")
         self.volume_var = tk.DoubleVar(value=12)
 
-        self.status_var = tk.StringVar(
-            value="Готов к работе"
-        )
+        self.status_var = tk.StringVar(value="Готов к работе")
+        self.progress_var = tk.DoubleVar(value=0)
+        self.progress_percent_var = tk.StringVar(value="0%")
+        self.page_title_var = tk.StringVar(value="")
+        self.page_subtitle_var = tk.StringVar(value="")
+        self.script_meta_var = tk.StringVar(value="0 слов · 0 сцен")
+        self.preview_info_var = tk.StringVar(value="Субтитры включены")
+        self.material_count_var = tk.StringVar(value="0 файлов")
+        self.scene_count_var = tk.StringVar(value="0 сцен")
+        self.library_video_count_var = tk.StringVar(value="0 клипов")
+        self.library_project_count_var = tk.StringVar(value="0 проектов")
+        self.volume_label_var = tk.StringVar(value="12%")
 
         self.ai_topic = tk.StringVar()
-        self.ai_duration = tk.StringVar(
-            value="30–60 секунд"
-        )
+        self.ai_duration = tk.StringVar(value="30–60 секунд")
 
         self.setup_style()
         self.build_interface()
         self.enable_clipboard()
         self.refresh_music()
+        self.refresh_library()
+        self.update_script_details()
+
+        for variable in (
+            self.voice_var,
+            self.speed_var,
+            self.subtitle_var,
+            self.export_srt_var,
+            self.subtitle_size,
+            self.mode_var,
+            self.music_var,
+            self.volume_var
+        ):
+            variable.trace_add("write", self.on_project_setting_changed)
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.after_idle(self.draw_preview)
+        self.root.after(500, self.restore_autosave)
 
     # --------------------------------------------------------
 
@@ -1041,439 +1181,986 @@ class NeuroHackStudio:
             pass
 
         style.configure(
-            "TNotebook",
-            background=BG,
-            borderwidth=0
-        )
-
-        style.configure(
-            "TNotebook.Tab",
-            background=PANEL,
+            "Dark.TCombobox",
+            fieldbackground=SURFACE_2,
+            background=SURFACE_2,
             foreground=WHITE,
-            padding=(15, 12)
+            arrowcolor=CYAN,
+            bordercolor=BORDER,
+            lightcolor=BORDER,
+            darkcolor=BORDER,
+            padding=(8, 6),
+            arrowsize=12
         )
-
         style.map(
-            "TNotebook.Tab",
-            background=[("selected", PURPLE)],
-            foreground=[("selected", WHITE)]
+            "Dark.TCombobox",
+            fieldbackground=[("readonly", SURFACE_2), ("focus", SURFACE_2)],
+            foreground=[("readonly", WHITE), ("disabled", MUTED)],
+            selectbackground=[("readonly", SURFACE_2)],
+            selectforeground=[("readonly", WHITE)]
         )
+        style.configure(
+            "Dark.TEntry",
+            fieldbackground=SURFACE_2,
+            foreground=WHITE,
+            insertcolor=CYAN,
+            bordercolor=BORDER,
+            lightcolor=BORDER,
+            darkcolor=BORDER,
+            padding=(9, 7)
+        )
+        style.configure(
+            "Horizontal.TProgressbar",
+            troughcolor="#202B3D",
+            background=CYAN,
+            bordercolor="#202B3D",
+            lightcolor=CYAN,
+            darkcolor=CYAN,
+            thickness=8
+        )
+        style.configure(
+            "TScrollbar",
+            background=SURFACE_2,
+            troughcolor=BG,
+            bordercolor=BG,
+            arrowcolor=MUTED
+        )
+        style.configure("TScale", background=SURFACE, troughcolor="#26354A")
+
+        try:
+            root_window = self.root
+            root_window.option_add("*TCombobox*Listbox.background", SURFACE_2)
+            root_window.option_add("*TCombobox*Listbox.foreground", WHITE)
+            root_window.option_add("*TCombobox*Listbox.selectBackground", PURPLE)
+            root_window.option_add("*TCombobox*Listbox.selectForeground", WHITE)
+        except Exception:
+            pass
 
     # --------------------------------------------------------
 
     def button(self, parent, text, command, color=PURPLE):
+        foreground = BG if color == CYAN else WHITE
+        active = "#69E8FF" if color == CYAN else "#7652D8"
         return tk.Button(
             parent,
             text=text,
             command=command,
             bg=color,
-            fg=WHITE,
-            activebackground=CYAN,
-            activeforeground=BG,
-            font=("Arial", 10, "bold"),
+            fg=foreground,
+            activebackground=active,
+            activeforeground=BG if color == CYAN else WHITE,
+            disabledforeground=MUTED,
+            font=("Arial", 9, "bold"),
             relief="flat",
+            bd=0,
             padx=12,
-            pady=9,
-            cursor="hand2"
+            pady=8,
+            cursor="hand2",
+            highlightthickness=0
         )
 
     # --------------------------------------------------------
 
-    def label(self, parent, text):
+    def label(self, parent, text, color=WHITE, font=None, bg=None, **kwargs):
+        if bg is None:
+            try:
+                bg = parent.cget("bg")
+            except Exception:
+                bg = BG
+
         return tk.Label(
             parent,
             text=text,
-            bg=BG,
-            fg=WHITE,
-            font=("Arial", 10)
+            bg=bg,
+            fg=color,
+            font=font or ("Arial", 10),
+            **kwargs
+        )
+
+    # --------------------------------------------------------
+
+    @staticmethod
+    def card(parent, **kwargs):
+        return tk.Frame(
+            parent,
+            bg=SURFACE,
+            highlightbackground=BORDER,
+            highlightcolor=BORDER,
+            highlightthickness=1,
+            **kwargs
         )
 
     # ========================================================
-    # ИНТЕРФЕЙС
+    # MAIN SHELL & NAVIGATION
     # ========================================================
 
     def build_interface(self):
-        header = tk.Frame(self.root, bg=BG)
+        self.root.grid_columnconfigure(0, weight=0, minsize=214)
+        self.root.grid_columnconfigure(1, weight=1)
+        self.root.grid_rowconfigure(0, weight=1)
 
-        header.pack(
-            fill="x",
-            padx=16,
-            pady=(12, 5)
-        )
+        self.sidebar = tk.Frame(self.root, bg=PANEL, width=214)
+        self.sidebar.grid(row=0, column=0, rowspan=2, sticky="nsew")
+        self.sidebar.grid_propagate(False)
+        self.sidebar.grid_rowconfigure(3, weight=1)
 
-        tk.Label(
-            header,
-            text="⚡ НЕЙРОХАК СТУДИЯ 4.2",
-            bg=BG,
+        brand = tk.Frame(self.sidebar, bg=PANEL)
+        brand.pack(fill="x", padx=18, pady=(22, 18))
+
+        mark = tk.Label(
+            brand,
+            text="✦",
+            bg="#17263A",
             fg=CYAN,
-            font=("Arial", 19, "bold")
-        ).pack(anchor="w")
-
-        tk.Label(
-            header,
-            text="VK КЛИПЫ • КИБЕРПАНК • АВТОМАТИЗАЦИЯ",
-            bg=BG,
-            fg=GRAY,
-            font=("Arial", 9)
-        ).pack(anchor="w")
-
-        # Нижняя панель остаётся видимой.
-
-        bottom = tk.Frame(self.root, bg=PANEL)
-        bottom.pack(side="bottom", fill="x")
-
-        tk.Label(
-            bottom,
-            textvariable=self.status_var,
-            bg=PANEL,
-            fg=CYAN,
-            anchor="w"
-        ).pack(
-            fill="x",
-            padx=12,
-            pady=(7, 0)
+            font=("Arial", 17, "bold"),
+            width=2,
+            height=1
         )
+        mark.pack(side="left", padx=(0, 10))
 
-        controls = tk.Frame(bottom, bg=PANEL)
+        brand_text = tk.Frame(brand, bg=PANEL)
+        brand_text.pack(side="left", fill="x", expand=True)
+        self.label(
+            brand_text,
+            "НЕЙРОХАК",
+            color=WHITE,
+            font=("Arial", 11, "bold")
+        ).pack(anchor="w")
+        self.label(
+            brand_text,
+            "СТУДИЯ 4.2",
+            color=MUTED,
+            font=("Arial", 8, "bold")
+        ).pack(anchor="w", pady=(2, 0))
 
-        controls.pack(
-            fill="x",
-            padx=10,
-            pady=8
-        )
+        tk.Frame(self.sidebar, bg=BORDER, height=1).pack(fill="x", padx=16)
+        self.label(
+            self.sidebar,
+            "РАБОЧЕЕ ПРОСТРАНСТВО",
+            color="#64748B",
+            font=("Arial", 8, "bold")
+        ).pack(anchor="w", padx=19, pady=(19, 8))
 
+        nav = tk.Frame(self.sidebar, bg=PANEL)
+        nav.pack(fill="x", padx=10)
+        self.nav_items = {}
+
+        nav_entries = [
+            ("create", "✦", "Создание клипа"),
+            ("ai", "✧", "ИИ-помощник"),
+            ("materials", "▧", "Материалы и сцены"),
+            ("music", "♫", "Музыка"),
+            ("library", "▤", "Проекты и результаты"),
+            ("settings", "⚙", "Настройки"),
+        ]
+
+        for key, icon, title in nav_entries:
+            item = tk.Frame(nav, bg=PANEL)
+            item.pack(fill="x", pady=2)
+            indicator = tk.Frame(item, bg=PANEL, width=3)
+            indicator.pack(side="left", fill="y", padx=(0, 7))
+            nav_button = tk.Button(
+                item,
+                text=f"{icon}   {title}",
+                command=lambda page=key: self.show_page(page),
+                bg=PANEL,
+                fg="#B6C2D3",
+                activebackground="#1A2940",
+                activeforeground=WHITE,
+                anchor="w",
+                font=("Arial", 9, "bold"),
+                relief="flat",
+                bd=0,
+                padx=10,
+                pady=11,
+                cursor="hand2",
+                highlightthickness=0
+            )
+            nav_button.pack(side="left", fill="x", expand=True)
+            self.nav_items[key] = (indicator, nav_button)
+
+        sidebar_bottom = tk.Frame(self.sidebar, bg=PANEL)
+        sidebar_bottom.pack(side="bottom", fill="x", padx=14, pady=16)
+        tk.Frame(sidebar_bottom, bg=BORDER, height=1).pack(fill="x", pady=(0, 12))
+        self.button(
+            sidebar_bottom,
+            "📁  Папка результатов",
+            self.open_output,
+            color=SURFACE_2
+        ).pack(fill="x")
+        self.label(
+            sidebar_bottom,
+            "Формат 9:16  ·  720 × 1280",
+            color=MUTED,
+            font=("Arial", 8)
+        ).pack(anchor="w", pady=(12, 0))
+
+        self.main_area = tk.Frame(self.root, bg=BG)
+        self.main_area.grid(row=0, column=1, sticky="nsew")
+        self.main_area.grid_rowconfigure(1, weight=1)
+        self.main_area.grid_columnconfigure(0, weight=1)
+
+        header = tk.Frame(self.main_area, bg=BG)
+        header.grid(row=0, column=0, sticky="ew", padx=24, pady=(18, 10))
+        header.grid_columnconfigure(0, weight=1)
+
+        heading = tk.Frame(header, bg=BG)
+        heading.grid(row=0, column=0, sticky="w")
+        self.label(
+            heading,
+            "",
+            color=WHITE,
+            font=("Arial", 18, "bold"),
+            textvariable=self.page_title_var
+        ).pack(anchor="w")
+        self.label(
+            heading,
+            "",
+            color=MUTED,
+            font=("Arial", 9),
+            textvariable=self.page_subtitle_var
+        ).pack(anchor="w", pady=(4, 0))
+
+        header_actions = tk.Frame(header, bg=BG)
+        header_actions.grid(row=0, column=1, sticky="e", padx=(14, 0))
+        self.button(
+            header_actions,
+            "Результаты",
+            self.open_output,
+            color=SURFACE_2
+        ).pack(side="left", padx=(0, 8))
         self.create_button = self.button(
-            controls,
-            "🎬 СОЗДАТЬ VK КЛИП",
+            header_actions,
+            "✦  СОЗДАТЬ КЛИП",
             self.start_creation,
-            CYAN
+            color=CYAN
         )
-
-        self.create_button.configure(
-            fg=BG,
-            font=("Arial", 12, "bold")
+        self.create_button.configure(font=("Arial", 9, "bold"), pady=10)
+        self.create_button.pack(side="left")
+        self.cancel_button = self.button(
+            header_actions,
+            "Остановить",
+            self.cancel_creation,
+            color="#633344"
         )
+        self.cancel_button.configure(state="disabled")
+        self.cancel_button.pack(side="left", padx=(8, 0))
 
-        self.create_button.pack(
-            side="left",
-            padx=5
-        )
+        self.page_container = tk.Frame(self.main_area, bg=BG)
+        self.page_container.grid(row=1, column=0, sticky="nsew", padx=18, pady=(4, 12))
+        self.page_container.grid_rowconfigure(0, weight=1)
+        self.page_container.grid_columnconfigure(0, weight=1)
 
-        self.button(
-            controls,
-            "▶ ПРОСМОТР",
-            self.preview_video
-        ).pack(side="left", padx=5)
+        self.tab_create = tk.Frame(self.page_container, bg=BG)
+        self.tab_ai = tk.Frame(self.page_container, bg=BG)
+        self.tab_materials = tk.Frame(self.page_container, bg=BG)
+        self.tab_music = tk.Frame(self.page_container, bg=BG)
+        self.tab_library = tk.Frame(self.page_container, bg=BG)
+        self.tab_settings = tk.Frame(self.page_container, bg=BG)
 
-        self.button(
-            controls,
-            "📁 РЕЗУЛЬТАТЫ",
-            self.open_output
-        ).pack(side="left", padx=5)
+        self.pages = {
+            "create": self.tab_create,
+            "ai": self.tab_ai,
+            "materials": self.tab_materials,
+            "music": self.tab_music,
+            "library": self.tab_library,
+            "settings": self.tab_settings,
+        }
 
-        self.notebook = ttk.Notebook(self.root)
-
-        self.notebook.pack(
-            fill="both",
-            expand=True,
-            padx=12,
-            pady=10
-        )
-
-        self.tab_create = tk.Frame(self.notebook, bg=BG)
-        self.tab_ai = tk.Frame(self.notebook, bg=BG)
-        self.tab_materials = tk.Frame(self.notebook, bg=BG)
-        self.tab_music = tk.Frame(self.notebook, bg=BG)
-        self.tab_settings = tk.Frame(self.notebook, bg=BG)
-
-        self.notebook.add(
-            self.tab_create,
-            text="Создание видео"
-        )
-
-        self.notebook.add(
-            self.tab_ai,
-            text="🤖 ИИ-ПОМОЩНИК"
-        )
-
-        self.notebook.add(
-            self.tab_materials,
-            text="Материалы"
-        )
-
-        self.notebook.add(
-            self.tab_music,
-            text="Музыка"
-        )
-
-        self.notebook.add(
-            self.tab_settings,
-            text="Настройки"
-        )
+        for page in self.pages.values():
+            page.grid(row=0, column=0, sticky="nsew")
 
         self.build_create_tab()
         self.build_ai_tab()
         self.build_materials_tab()
         self.build_music_tab()
+        self.build_library_tab()
         self.build_settings_tab()
 
-    # ========================================================
+        self.footer = tk.Frame(
+            self.root,
+            bg=PANEL,
+            highlightbackground=BORDER,
+            highlightcolor=BORDER,
+            highlightthickness=1
+        )
+        self.footer.grid(row=1, column=1, sticky="ew")
+        self.footer.grid_columnconfigure(1, weight=1)
+
+        status_row = tk.Frame(self.footer, bg=PANEL)
+        status_row.grid(row=0, column=0, sticky="ew", padx=18, pady=(8, 4))
+        status_row.grid_columnconfigure(1, weight=1)
+        self.label(
+            status_row,
+            "●",
+            color=CYAN,
+            font=("Arial", 9, "bold")
+        ).grid(row=0, column=0, padx=(0, 8))
+        self.label(
+            status_row,
+            "",
+            color="#D4DCE8",
+            font=("Arial", 9),
+            textvariable=self.status_var,
+            anchor="w"
+        ).grid(row=0, column=1, sticky="ew")
+        self.label(
+            status_row,
+            "",
+            color=CYAN,
+            font=("Arial", 9, "bold"),
+            textvariable=self.progress_percent_var
+        ).grid(row=0, column=2, padx=(12, 0))
+
+        self.progress_bar = ttk.Progressbar(
+            self.footer,
+            mode="determinate",
+            maximum=100,
+            variable=self.progress_var,
+            style="Horizontal.TProgressbar"
+        )
+        self.progress_bar.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 11))
+
+        self.show_page("create")
+
+    # --------------------------------------------------------
+
+    def show_page(self, key):
+        if key not in self.pages:
+            return
+
+        self.pages[key].tkraise()
+        title, subtitle = self.PAGE_META[key]
+        self.page_title_var.set(title)
+        self.page_subtitle_var.set(subtitle)
+
+        for page_key, (indicator, nav_button) in self.nav_items.items():
+            active = page_key == key
+            indicator.configure(bg=CYAN if active else PANEL)
+            nav_button.configure(
+                bg="#1A2940" if active else PANEL,
+                fg=CYAN if active else "#B6C2D3"
+            )
+
+        if key == "create":
+            self.schedule_preview()
+
+    # --------------------------------------------------------
     # СОЗДАНИЕ ВИДЕО
-    # ========================================================
+    # --------------------------------------------------------
 
     def build_create_tab(self):
-        top = tk.Frame(self.tab_create, bg=BG)
+        self.tab_create.grid_columnconfigure(0, weight=7, minsize=330)
+        self.tab_create.grid_columnconfigure(1, weight=4, minsize=200)
+        self.tab_create.grid_rowconfigure(0, weight=1)
 
-        top.pack(
-            fill="x",
-            padx=12,
-            pady=10
+        self.editor_panel = self.card(self.tab_create)
+        self.editor_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
+        self.editor_panel.grid_columnconfigure(0, weight=1)
+        self.editor_panel.grid_rowconfigure(1, weight=1)
+
+        editor_heading = tk.Frame(self.editor_panel, bg=SURFACE)
+        editor_heading.grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 10))
+        editor_heading.grid_columnconfigure(0, weight=1)
+        self.label(
+            editor_heading,
+            "Сценарий клипа",
+            color=WHITE,
+            font=("Arial", 12, "bold")
+        ).grid(row=0, column=0, sticky="w")
+        self.label(
+            editor_heading,
+            "",
+            color=MUTED,
+            font=("Arial", 8),
+            textvariable=self.script_meta_var
+        ).grid(row=0, column=1, sticky="e")
+
+        editor_box = tk.Frame(
+            self.editor_panel,
+            bg=EDITOR_BG,
+            highlightbackground=BORDER,
+            highlightcolor=BORDER,
+            highlightthickness=1
         )
+        editor_box.grid(row=1, column=0, sticky="nsew", padx=15, pady=(0, 10))
+        editor_box.grid_columnconfigure(0, weight=1)
+        editor_box.grid_rowconfigure(0, weight=1)
 
-        self.label(top, "Голос:").grid(
-            row=0, column=0, padx=5, pady=6
+        self.script_text = tk.Text(
+            editor_box,
+            bg=EDITOR_BG,
+            fg=WHITE,
+            insertbackground=CYAN,
+            selectbackground=PURPLE,
+            selectforeground=WHITE,
+            font=("Arial", 11),
+            wrap="word",
+            undo=True,
+            relief="flat",
+            bd=0,
+            padx=13,
+            pady=12,
+            spacing1=2,
+            spacing3=3,
+            highlightthickness=0
         )
+        script_scroll = ttk.Scrollbar(editor_box, orient="vertical", command=self.script_text.yview)
+        self.script_text.configure(yscrollcommand=script_scroll.set)
+        self.script_text.grid(row=0, column=0, sticky="nsew")
+        script_scroll.grid(row=0, column=1, sticky="ns")
+        self.script_text.insert(
+            "1.0",
+            "Привет! Это Нейрохак. Сегодня расскажу о бесплатной нейросети, "
+            "которая поможет тебе экономить время. Подписывайся на наше сообщество!"
+        )
+        self.script_text.edit_modified(False)
+        self.script_text.bind("<<Modified>>", self.on_script_changed)
 
-        ttk.Combobox(
-            top,
+        editor_actions = tk.Frame(self.editor_panel, bg=SURFACE)
+        editor_actions.grid(row=2, column=0, sticky="ew", padx=15, pady=(0, 11))
+        self.button(
+            editor_actions,
+            "Сохранить",
+            self.save_project,
+            color=SURFACE_2
+        ).pack(side="left", padx=(0, 4))
+        self.button(
+            editor_actions,
+            "Открыть",
+            self.load_project,
+            color=SURFACE_2
+        ).pack(side="left", padx=4)
+        self.button(
+            editor_actions,
+            "Шаблон",
+            self.insert_script_template,
+            color=SURFACE_2
+        ).pack(side="left", padx=4)
+        self.button(
+            editor_actions,
+            "Сцены",
+            self.prepare_scenes,
+            color=PURPLE
+        ).pack(side="right")
+
+        options = tk.Frame(
+            self.editor_panel,
+            bg=SURFACE_2,
+            highlightbackground=BORDER,
+            highlightcolor=BORDER,
+            highlightthickness=1
+        )
+        options.grid(row=3, column=0, sticky="ew", padx=15, pady=(0, 15))
+        for column in (1, 3):
+            options.grid_columnconfigure(column, weight=1)
+
+        self.label(options, "ГОЛОС", color=MUTED, font=("Arial", 8, "bold")).grid(
+            row=0, column=0, sticky="w", padx=(11, 5), pady=(10, 6)
+        )
+        self.voice_combo = ttk.Combobox(
+            options,
             textvariable=self.voice_var,
             values=list(VOICE_MODELS),
             state="readonly",
-            width=13
-        ).grid(row=0, column=1, padx=5)
-
-        self.label(top, "Скорость:").grid(
-            row=0, column=2, padx=5
+            width=11,
+            style="Dark.TCombobox"
         )
+        self.voice_combo.grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=(8, 5))
 
-        ttk.Combobox(
-            top,
+        self.label(options, "СКОРОСТЬ", color=MUTED, font=("Arial", 8, "bold")).grid(
+            row=0, column=2, sticky="w", padx=(4, 5), pady=(10, 6)
+        )
+        self.speed_combo = ttk.Combobox(
+            options,
             textvariable=self.speed_var,
             values=list(VOICE_SPEEDS),
             state="readonly",
-            width=13
-        ).grid(row=0, column=3, padx=5)
-
-        self.button(
-            top,
-            "🔊 Проверить голос",
-            self.test_voice
-        ).grid(row=0, column=4, padx=10)
-
-        tk.Checkbutton(
-            top,
-            text="Субтитры ВКЛ",
-            variable=self.subtitle_var,
-            bg=BG,
-            fg=CYAN,
-            selectcolor=PANEL,
-            activebackground=BG,
-            activeforeground=CYAN
-        ).grid(
-            row=1,
-            column=0,
-            columnspan=2,
-            sticky="w",
-            pady=10
+            width=11,
+            style="Dark.TCombobox"
         )
+        self.speed_combo.grid(row=0, column=3, sticky="ew", padx=(0, 10), pady=(8, 5))
 
-        self.label(
-            top,
-            "Размер субтитров:"
-        ).grid(row=1, column=2, padx=5)
+        self.subtitle_check = tk.Checkbutton(
+            options,
+            text="Субтитры",
+            variable=self.subtitle_var,
+            command=self.on_preview_setting_changed,
+            bg=SURFACE_2,
+            fg=CYAN,
+            selectcolor=BG,
+            activebackground=SURFACE_2,
+            activeforeground=CYAN,
+            font=("Arial", 9, "bold"),
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            cursor="hand2"
+        )
+        self.subtitle_check.grid(row=1, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 8))
 
-        ttk.Combobox(
-            top,
+        self.label(options, "РАЗМЕР", color=MUTED, font=("Arial", 8, "bold")).grid(
+            row=1, column=2, sticky="w", padx=(4, 5), pady=(0, 7)
+        )
+        self.subtitle_combo = ttk.Combobox(
+            options,
             textvariable=self.subtitle_size,
             values=list(SUBTITLE_SIZES),
             state="readonly",
-            width=13
-        ).grid(row=1, column=3, padx=5)
+            width=11,
+            style="Dark.TCombobox"
+        )
+        self.subtitle_combo.grid(row=1, column=3, sticky="ew", padx=(0, 10), pady=(0, 7))
+        self.subtitle_combo.bind("<<ComboboxSelected>>", self._subtitle_size_changed)
 
+        self.srt_check = tk.Checkbutton(
+            options,
+            text="Экспортировать субтитры .srt",
+            variable=self.export_srt_var,
+            bg=SURFACE_2,
+            fg=MUTED,
+            selectcolor=BG,
+            activebackground=SURFACE_2,
+            activeforeground=WHITE,
+            font=("Arial", 8),
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            cursor="hand2"
+        )
+        self.srt_check.grid(row=2, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 10))
+
+        self.button(
+            options,
+            "Проверить голос",
+            self.test_voice,
+            color="#25354C"
+        ).grid(row=2, column=2, columnspan=2, sticky="e", padx=10, pady=(0, 10))
+
+        self.preview_panel = self.card(self.tab_create)
+        self.preview_panel.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
+        self.preview_panel.grid_columnconfigure(0, weight=1)
+        self.preview_panel.grid_rowconfigure(2, weight=1)
+
+        preview_heading = tk.Frame(self.preview_panel, bg=SURFACE)
+        preview_heading.grid(row=0, column=0, sticky="ew", padx=15, pady=(14, 2))
+        preview_heading.grid_columnconfigure(0, weight=1)
         self.label(
-            self.tab_create,
-            "Сценарий для VK Клипа:"
-        ).pack(
-            anchor="w",
-            padx=17,
-            pady=(5, 3)
+            preview_heading,
+            "Предпросмотр",
+            color=WHITE,
+            font=("Arial", 12, "bold")
+        ).grid(row=0, column=0, sticky="w")
+        self.label(
+            preview_heading,
+            "9:16",
+            color=CYAN,
+            font=("Arial", 9, "bold")
+        ).grid(row=0, column=1, sticky="e")
+        self.label(
+            self.preview_panel,
+            "Так будет выглядеть вертикальный кадр",
+            color=MUTED,
+            font=("Arial", 8)
+        ).grid(row=1, column=0, sticky="w", padx=15, pady=(0, 6))
+
+        self.preview_canvas = tk.Canvas(
+            self.preview_panel,
+            bg=SURFACE,
+            bd=0,
+            highlightthickness=0
+        )
+        self.preview_canvas.grid(row=2, column=0, sticky="nsew", padx=7, pady=3)
+        self.preview_canvas.bind("<Configure>", self.draw_preview)
+
+        preview_footer = tk.Frame(self.preview_panel, bg=SURFACE)
+        preview_footer.grid(row=3, column=0, sticky="ew", padx=15, pady=(5, 14))
+        self.label(
+            preview_footer,
+            "",
+            color=MUTED,
+            font=("Arial", 8),
+            textvariable=self.preview_info_var
+        ).pack(anchor="w")
+        self.label(
+            preview_footer,
+            "720 × 1280 px  ·  25 FPS",
+            color="#697A92",
+            font=("Arial", 8)
+        ).pack(anchor="w", pady=(3, 0))
+
+    # --------------------------------------------------------
+
+    def insert_script_template(self):
+        template = (
+            "ЗАЦЕПКА: Скажи, чем эта тема удивит зрителя.\n\n"
+            "СУТЬ: Объясни главную мысль простыми словами.\n\n"
+            "ПОЛЬЗА: Дай конкретный совет или короткий пример.\n\n"
+            "ПРИЗЫВ: Предложи подписаться, сохранить или попробовать."
+        )
+        self.script_text.insert("insert", template)
+        self.script_text.focus_set()
+        self.update_script_details()
+        self.schedule_preview()
+        self.is_dirty = True
+        self.schedule_autosave()
+
+    def on_script_changed(self, _event=None):
+        if not self.script_text.edit_modified():
+            return
+        self.script_text.edit_modified(False)
+        self.update_script_details()
+        self.schedule_preview()
+        if not self._loading_project:
+            self.is_dirty = True
+            self.schedule_autosave()
+
+    def on_preview_setting_changed(self):
+        self.preview_info_var.set(
+            "Субтитры включены" if self.subtitle_var.get() else "Субтитры выключены"
+        )
+        self.schedule_preview()
+
+    def _subtitle_size_changed(self, _event=None):
+        self.schedule_preview()
+
+    def update_script_details(self):
+        if not hasattr(self, "script_text"):
+            return
+        text = self.script_text.get("1.0", "end-1c").strip()
+        word_count = len(re.findall(r"\S+", text))
+        scene_count = len(split_script(text))
+        estimate = max(1, round(word_count / 2.7)) if word_count else 0
+        self.script_meta_var.set(
+            f"{word_count} {russian_plural(word_count, 'слово', 'слова', 'слов')}"
+            f"  ·  {scene_count} {russian_plural(scene_count, 'сцена', 'сцены', 'сцен')}"
+            f"  ·  около {estimate} сек."
         )
 
-        self.script_text = tk.Text(
-            self.tab_create,
-            bg=PANEL,
-            fg=WHITE,
-            insertbackground=CYAN,
-            selectbackground=PURPLE,
-            font=("Arial", 12),
-            wrap="word",
-            undo=True,
-            relief="flat"
+    def schedule_preview(self):
+        if not hasattr(self, "preview_canvas"):
+            return
+        if self._preview_after is not None:
+            try:
+                self.root.after_cancel(self._preview_after)
+            except Exception:
+                pass
+        self._preview_after = self.root.after(70, self.draw_preview)
+
+    @staticmethod
+    def _rounded_rectangle(canvas, x1, y1, x2, y2, radius, **kwargs):
+        radius = max(2, min(radius, (x2 - x1) / 2, (y2 - y1) / 2))
+        points = [
+            x1 + radius, y1,
+            x2 - radius, y1,
+            x2, y1 + radius,
+            x2, y2 - radius,
+            x2 - radius, y2,
+            x1 + radius, y2,
+            x1, y2 - radius,
+            x1, y1 + radius,
+        ]
+        return canvas.create_polygon(
+            *points,
+            smooth=True,
+            splinesteps=18,
+            **kwargs
         )
 
-        self.script_text.pack(
-            fill="both",
-            expand=True,
-            padx=15,
-            pady=7
+    @staticmethod
+    def _mix_color(first, second, ratio):
+        ratio = max(0.0, min(1.0, ratio))
+        a = tuple(int(first[index:index + 2], 16) for index in (1, 3, 5))
+        b = tuple(int(second[index:index + 2], 16) for index in (1, 3, 5))
+        mixed = tuple(round(a[i] + (b[i] - a[i]) * ratio) for i in range(3))
+        return "#" + "".join(f"{channel:02x}" for channel in mixed)
+
+    def draw_preview(self, _event=None):
+        if not hasattr(self, "preview_canvas"):
+            return
+        canvas = self.preview_canvas
+        width = max(1, canvas.winfo_width())
+        height = max(1, canvas.winfo_height())
+        if width < 40 or height < 40:
+            return
+
+        canvas.delete("all")
+        available_width = max(40, width - 28)
+        available_height = max(60, height - 22)
+        phone_width = min(available_width, available_height * 9 / 16)
+        phone_height = phone_width * 16 / 9
+        left = (width - phone_width) / 2
+        top = (height - phone_height) / 2
+        right = left + phone_width
+        bottom = top + phone_height
+        radius = max(9, phone_width * 0.075)
+
+        self._rounded_rectangle(
+            canvas,
+            left - 2,
+            top - 2,
+            right + 2,
+            bottom + 2,
+            radius + 2,
+            fill="#050810",
+            outline="#2B3C55",
+            width=2
         )
 
-        self.script_text.insert(
-            "1.0",
-            "Привет! Это Нейрохак. "
-            "Сегодня расскажу о бесплатной нейросети, "
-            "которая поможет тебе экономить время. "
-            "Подписывайся на наше сообщество!"
+        inner_left = left + 2
+        inner_right = right - 2
+        inner_top = top + 2
+        inner_bottom = bottom - 2
+        gradient_steps = 20
+        for step in range(gradient_steps):
+            y1 = inner_top + (inner_bottom - inner_top) * step / gradient_steps
+            y2 = inner_top + (inner_bottom - inner_top) * (step + 1) / gradient_steps + 1
+            shade = self._mix_color("#142443", "#080D19", step / (gradient_steps - 1))
+            canvas.create_rectangle(
+                inner_left,
+                y1,
+                inner_right,
+                y2,
+                fill=shade,
+                outline=""
+            )
+
+        center_x = (left + right) / 2
+        phone_height = inner_bottom - inner_top
+        canvas.create_text(
+            center_x,
+            inner_top + phone_height * 0.09,
+            text="NEUROHACK  ·  VK CLIPS",
+            fill=CYAN,
+            font=("Arial", max(7, int(phone_width * 0.045)), "bold")
         )
 
-        actions = tk.Frame(
-            self.tab_create,
-            bg=BG
+        icon_y = inner_top + phone_height * 0.37
+        icon_radius = phone_width * 0.19
+        canvas.create_oval(
+            center_x - icon_radius,
+            icon_y - icon_radius,
+            center_x + icon_radius,
+            icon_y + icon_radius,
+            fill="#142844",
+            outline="#24607A",
+            width=max(1, int(phone_width * 0.009))
+        )
+        canvas.create_oval(
+            center_x - icon_radius * 0.68,
+            icon_y - icon_radius * 0.68,
+            center_x + icon_radius * 0.68,
+            icon_y + icon_radius * 0.68,
+            outline="#31506F",
+            width=1
+        )
+        canvas.create_text(
+            center_x,
+            icon_y,
+            text="✦",
+            fill=CYAN,
+            font=("Arial", max(15, int(phone_width * 0.15)), "bold")
+        )
+        canvas.create_text(
+            center_x,
+            icon_y + icon_radius + phone_height * 0.055,
+            text="ИДЕЯ  ·  ГОЛОС  ·  ВИДЕО",
+            fill="#99AFC9",
+            font=("Arial", max(6, int(phone_width * 0.032)), "bold")
         )
 
-        actions.pack(
-            fill="x",
-            padx=15,
-            pady=8
+        subtitle_top = inner_top + phone_height * 0.68
+        subtitle_bottom = inner_top + phone_height * 0.88
+        self._rounded_rectangle(
+            canvas,
+            left + phone_width * 0.075,
+            subtitle_top,
+            right - phone_width * 0.075,
+            subtitle_bottom,
+            max(5, phone_width * 0.035),
+            fill="#080B13",
+            outline="#26374F",
+            width=1
         )
 
-        self.button(
-            actions,
-            "💾 Сохранить проект",
-            self.save_project
-        ).pack(side="left", padx=4)
+        script = self.script_text.get("1.0", "end-1c").strip() if hasattr(self, "script_text") else ""
+        snippet = " ".join(script.split()[:10]) if script else "Ваш текст появится здесь"
+        if not self.subtitle_var.get():
+            snippet = "Субтитры выключены"
+        subtitle_scale = {
+            "Маленькие": 0.052,
+            "Средние": 0.062,
+            "Крупные": 0.073
+        }.get(self.subtitle_size.get(), 0.062)
+        canvas.create_text(
+            center_x,
+            (subtitle_top + subtitle_bottom) / 2,
+            text=snippet,
+            width=phone_width * 0.72,
+            justify="center",
+            fill=WHITE if self.subtitle_var.get() else "#8190A7",
+            font=("Arial", max(8, int(phone_width * subtitle_scale)), "bold")
+        )
 
-        self.button(
-            actions,
-            "📂 Открыть проект",
-            self.load_project
-        ).pack(side="left", padx=4)
-
-        self.button(
-            actions,
-            "🎞 Подготовить сцены",
-            self.prepare_scenes
-        ).pack(side="left", padx=4)
+        canvas.create_text(
+            center_x,
+            inner_bottom - phone_height * 0.045,
+            text="●  NEUROHACK STUDIO",
+            fill="#6F829D",
+            font=("Arial", max(6, int(phone_width * 0.03)), "bold")
+        )
 
     # ========================================================
-    # НОВАЯ ВКЛАДКА ИИ-ПОМОЩНИК
+    # ИИ-ПОМОЩНИК
     # ========================================================
 
     def build_ai_tab(self):
-        tk.Label(
-            self.tab_ai,
-            text="🤖 ПОМОЩНИК НЕЙРОХАК",
-            bg=BG,
-            fg=CYAN,
-            font=("Arial", 18, "bold")
-        ).pack(pady=12)
+        self.tab_ai.grid_columnconfigure(0, weight=1)
+        self.tab_ai.grid_rowconfigure(1, weight=1)
+
+        prompt_panel = self.card(self.tab_ai)
+        prompt_panel.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        prompt_panel.grid_columnconfigure(0, weight=1)
 
         self.label(
-            self.tab_ai,
-            "Тема будущего VK Клипа:"
-        ).pack(anchor="w", padx=20)
+            prompt_panel,
+            "О чём будет ролик?",
+            color=WHITE,
+            font=("Arial", 12, "bold")
+        ).grid(row=0, column=0, sticky="w", padx=16, pady=(14, 3))
+        self.label(
+            prompt_panel,
+            "Укажите тему — помощник подготовит сценарий, заголовок и описание.",
+            color=MUTED,
+            font=("Arial", 9)
+        ).grid(row=1, column=0, sticky="w", padx=16, pady=(0, 10))
 
+        input_row = tk.Frame(prompt_panel, bg=SURFACE)
+        input_row.grid(row=2, column=0, sticky="ew", padx=15, pady=(0, 14))
+        input_row.grid_columnconfigure(0, weight=1)
         self.ai_topic_entry = ttk.Entry(
-            self.tab_ai,
+            input_row,
             textvariable=self.ai_topic,
-            width=70
+            style="Dark.TEntry"
         )
+        self.ai_topic_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        self.ai_topic_entry.insert(0, "Например: нейросеть для учёбы")
+        self.ai_topic_entry.configure(foreground=MUTED)
+        self.ai_topic_entry.bind("<FocusIn>", self._clear_ai_placeholder)
+        self.ai_topic_entry.bind("<FocusOut>", self._restore_ai_placeholder)
 
-        self.ai_topic_entry.pack(
-            fill="x",
-            padx=20,
-            pady=8
-        )
-
-        self.label(
-            self.tab_ai,
-            "Продолжительность:"
-        ).pack(anchor="w", padx=20)
-
+        duration_box = tk.Frame(input_row, bg=SURFACE)
+        duration_box.grid(row=0, column=1, sticky="e", padx=(0, 10))
+        self.label(duration_box, "Длительность", color=MUTED, font=("Arial", 8)).pack(anchor="w", pady=(0, 3))
         ttk.Combobox(
-            self.tab_ai,
+            duration_box,
             textvariable=self.ai_duration,
-            values=[
-                "15–30 секунд",
-                "30–60 секунд",
-                "60–90 секунд"
-            ],
+            values=["15–30 секунд", "30–60 секунд", "60–90 секунд"],
             state="readonly",
-            width=25
-        ).pack(
-            anchor="w",
-            padx=20,
-            pady=8
-        )
-
-        buttons = tk.Frame(self.tab_ai, bg=BG)
-
-        buttons.pack(
-            fill="x",
-            padx=15,
-            pady=5
-        )
+            width=16,
+            style="Dark.TCombobox"
+        ).pack()
 
         self.button(
-            buttons,
-            "⚡ СОЗДАТЬ СЦЕНАРИЙ",
+            input_row,
+            "Создать сценарий",
             self.ai_generate,
-            CYAN
-        ).pack(side="left", padx=5)
-
+            color=CYAN
+        ).grid(row=0, column=2, sticky="e", padx=(0, 7))
         self.button(
-            buttons,
-            "💡 СОЗДАТЬ 10 ИДЕЙ",
-            self.ai_ideas
-        ).pack(side="left", padx=5)
+            input_row,
+            "10 идей",
+            self.ai_ideas,
+            color=SURFACE_2
+        ).grid(row=0, column=3, sticky="e")
 
+        result_panel = self.card(self.tab_ai)
+        result_panel.grid(row=1, column=0, sticky="nsew")
+        result_panel.grid_columnconfigure(0, weight=1)
+        result_panel.grid_rowconfigure(1, weight=1)
+
+        result_heading = tk.Frame(result_panel, bg=SURFACE)
+        result_heading.grid(row=0, column=0, sticky="ew", padx=15, pady=(12, 8))
+        result_heading.grid_columnconfigure(0, weight=1)
         self.label(
-            self.tab_ai,
-            "Результат:"
-        ).pack(anchor="w", padx=20, pady=(8, 0))
+            result_heading,
+            "Результат генерации",
+            color=WHITE,
+            font=("Arial", 11, "bold")
+        ).grid(row=0, column=0, sticky="w")
+        self.label(
+            result_heading,
+            "Можно отредактировать перед переносом",
+            color=MUTED,
+            font=("Arial", 8)
+        ).grid(row=0, column=1, sticky="e")
 
+        result_box = tk.Frame(
+            result_panel,
+            bg=EDITOR_BG,
+            highlightbackground=BORDER,
+            highlightcolor=BORDER,
+            highlightthickness=1
+        )
+        result_box.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 10))
+        result_box.grid_columnconfigure(0, weight=1)
+        result_box.grid_rowconfigure(0, weight=1)
         self.ai_result = tk.Text(
-            self.tab_ai,
-            bg=PANEL,
+            result_box,
+            bg=EDITOR_BG,
             fg=WHITE,
             insertbackground=CYAN,
             selectbackground=PURPLE,
+            selectforeground=WHITE,
             wrap="word",
-            font=("Arial", 11),
-            undo=True
+            font=("Arial", 10),
+            undo=True,
+            relief="flat",
+            bd=0,
+            padx=13,
+            pady=12,
+            highlightthickness=0
         )
+        result_scroll = ttk.Scrollbar(result_box, orient="vertical", command=self.ai_result.yview)
+        self.ai_result.configure(yscrollcommand=result_scroll.set)
+        self.ai_result.grid(row=0, column=0, sticky="nsew")
+        result_scroll.grid(row=0, column=1, sticky="ns")
 
-        self.ai_result.pack(
-            fill="both",
-            expand=True,
-            padx=20,
-            pady=8
-        )
-
+        result_actions = tk.Frame(result_panel, bg=SURFACE)
+        result_actions.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 13))
         self.button(
-            self.tab_ai,
-            "🎬 ПЕРЕДАТЬ СЦЕНАРИЙ В СОЗДАНИЕ ВИДЕО",
-            self.ai_to_video
-        ).pack(
-            anchor="w",
-            padx=20,
-            pady=(3, 12)
-        )
+            result_actions,
+            "Копировать сценарий",
+            self.copy_ai_script,
+            color=SURFACE_2
+        ).pack(side="left")
+        self.button(
+            result_actions,
+            "Передать в редактор  →",
+            self.ai_to_video,
+            color=PURPLE
+        ).pack(side="right")
 
-    # --------------------------------------------------------
+    def _clear_ai_placeholder(self, _event=None):
+        if self.ai_topic_entry.get() == "Например: нейросеть для учёбы":
+            self.ai_topic_entry.delete(0, tk.END)
+            self.ai_topic_entry.configure(foreground=WHITE)
+
+    def _restore_ai_placeholder(self, _event=None):
+        if not self.ai_topic_entry.get().strip():
+            self.ai_topic_entry.delete(0, tk.END)
+            self.ai_topic_entry.insert(0, "Например: нейросеть для учёбы")
+            self.ai_topic_entry.configure(foreground=MUTED)
 
     def ai_generate(self):
         try:
             topic = self.ai_topic.get().strip()
+            if topic == "Например: нейросеть для учёбы":
+                topic = ""
 
-            script = generate_script(
-                topic,
-                self.ai_duration.get()
-            )
-
+            script = generate_script(topic, self.ai_duration.get())
             title = generate_title(topic)
             description = generate_description(topic)
-
             self.ai_script = script
 
             result = (
@@ -1481,275 +2168,634 @@ class NeuroHackStudio:
                 f"СЦЕНАРИЙ:\n{script}\n\n"
                 f"ОПИСАНИЕ:\n{description}"
             )
-
             self.ai_result.delete("1.0", tk.END)
             self.ai_result.insert("1.0", result)
-
         except Exception as error:
-            messagebox.showerror(
-                "Помощник",
-                str(error)
-            )
+            messagebox.showerror("Помощник", str(error))
 
-    # --------------------------------------------------------
+    def get_ai_script_from_result(self):
+        result = self.ai_result.get("1.0", "end-1c")
+        match = re.search(
+            r"(?is)СЦЕНАРИЙ:\s*(.*?)(?:\n\s*ОПИСАНИЕ:|\Z)",
+            result
+        )
+        if match and match.group(1).strip():
+            return match.group(1).strip()
+        return self.ai_script.strip()
+
+    def copy_ai_script(self):
+        script = self.get_ai_script_from_result()
+        if not script:
+            messagebox.showwarning("Помощник", "Сначала создай сценарий.")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(script)
+        self.status_var.set("Сценарий скопирован в буфер обмена")
 
     def ai_to_video(self):
-        if not self.ai_script:
-            messagebox.showwarning(
-                "Помощник",
-                "Сначала создай сценарий."
-            )
+        script = self.get_ai_script_from_result()
+        if not script:
+            messagebox.showwarning("Помощник", "Сначала создай сценарий.")
             return
 
         self.script_text.delete("1.0", tk.END)
-        self.script_text.insert(
-            "1.0",
-            self.ai_script
-        )
-
-        self.notebook.select(self.tab_create)
-
-    # --------------------------------------------------------
+        self.script_text.insert("1.0", script)
+        self.update_script_details()
+        self.show_page("create")
 
     def ai_ideas(self):
+        self.ai_script = ""
         ideas = generate_ideas(10)
-
         result = "10 ИДЕЙ ДЛЯ VK КЛИПОВ:\n\n"
-
         for index, idea in enumerate(ideas, 1):
             result += f"{index}. {idea}\n"
-
         self.ai_result.delete("1.0", tk.END)
         self.ai_result.insert("1.0", result)
 
     # ========================================================
-    # МАТЕРИАЛЫ
+    # МАТЕРИАЛЫ, МУЗЫКА И НАСТРОЙКИ
     # ========================================================
 
     def build_materials_tab(self):
-        top = tk.Frame(self.tab_materials, bg=BG)
+        self.tab_materials.grid_columnconfigure(0, weight=1)
+        self.tab_materials.grid_columnconfigure(1, weight=1)
+        self.tab_materials.grid_rowconfigure(0, weight=1)
 
-        top.pack(
-            fill="x",
-            padx=12,
-            pady=12
-        )
+        material_panel = self.card(self.tab_materials)
+        material_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
+        material_panel.grid_columnconfigure(0, weight=1)
+        material_panel.grid_rowconfigure(2, weight=1)
 
-        self.button(
-            top,
-            "➕ Добавить фото и видео",
-            self.add_materials
-        ).pack(side="left", padx=5)
-
-        self.button(
-            top,
-            "🗑 Очистить список",
-            self.clear_materials
-        ).pack(side="left", padx=5)
-
+        material_heading = tk.Frame(material_panel, bg=SURFACE)
+        material_heading.grid(row=0, column=0, sticky="ew", padx=15, pady=(14, 5))
+        material_heading.grid_columnconfigure(0, weight=1)
         self.label(
-            self.tab_materials,
-            "Добавленные материалы:"
-        ).pack(anchor="w", padx=16)
+            material_heading,
+            "Исходные материалы",
+            color=WHITE,
+            font=("Arial", 12, "bold")
+        ).grid(row=0, column=0, sticky="w")
+        self.label(
+            material_heading,
+            "",
+            color=MUTED,
+            font=("Arial", 8),
+            textvariable=self.material_count_var
+        ).grid(row=0, column=1, sticky="e")
 
+        material_actions = tk.Frame(material_panel, bg=SURFACE)
+        material_actions.grid(row=1, column=0, sticky="ew", padx=14, pady=(2, 9))
+        self.button(
+            material_actions,
+            "+ Добавить",
+            self.add_materials,
+            color=CYAN
+        ).pack(side="left", padx=(0, 6))
+        self.button(
+            material_actions,
+            "Убрать",
+            self.remove_selected_material,
+            color=SURFACE_2
+        ).pack(side="left", padx=6)
+        self.button(
+            material_actions,
+            "Очистить",
+            self.clear_materials,
+            color=SURFACE_2
+        ).pack(side="right")
+
+        material_list_box = tk.Frame(
+            material_panel,
+            bg=EDITOR_BG,
+            highlightbackground=BORDER,
+            highlightcolor=BORDER,
+            highlightthickness=1
+        )
+        material_list_box.grid(row=2, column=0, sticky="nsew", padx=14, pady=(0, 9))
+        material_list_box.grid_columnconfigure(0, weight=1)
+        material_list_box.grid_rowconfigure(0, weight=1)
         self.material_list = tk.Listbox(
-            self.tab_materials,
-            bg=PANEL,
+            material_list_box,
+            bg=EDITOR_BG,
             fg=WHITE,
             selectbackground=PURPLE,
-            height=7
+            selectforeground=WHITE,
+            activestyle="none",
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            font=("Arial", 9),
+            padx=8,
+            pady=6
         )
-
-        self.material_list.pack(
-            fill="x",
-            padx=15,
-            pady=7
-        )
-
-        mode_frame = tk.Frame(
-            self.tab_materials,
-            bg=BG
-        )
-
-        mode_frame.pack(fill="x", padx=15)
-
+        material_scroll = ttk.Scrollbar(material_list_box, orient="vertical", command=self.material_list.yview)
+        self.material_list.configure(yscrollcommand=material_scroll.set)
+        self.material_list.grid(row=0, column=0, sticky="nsew")
+        material_scroll.grid(row=0, column=1, sticky="ns")
         self.label(
-            mode_frame,
-            "Распределение:"
-        ).pack(side="left", padx=5)
+            material_panel,
+            "Поддерживаются изображения и видеофайлы.",
+            color=MUTED,
+            font=("Arial", 8)
+        ).grid(row=3, column=0, sticky="w", padx=15, pady=(0, 13))
 
-        ttk.Combobox(
-            mode_frame,
+        scene_panel = self.card(self.tab_materials)
+        scene_panel.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
+        scene_panel.grid_columnconfigure(0, weight=1)
+        scene_panel.grid_rowconfigure(2, weight=1)
+
+        scene_heading = tk.Frame(scene_panel, bg=SURFACE)
+        scene_heading.grid(row=0, column=0, sticky="ew", padx=15, pady=(14, 7))
+        scene_heading.grid_columnconfigure(0, weight=1)
+        self.label(
+            scene_heading,
+            "Сцены сценария",
+            color=WHITE,
+            font=("Arial", 12, "bold")
+        ).grid(row=0, column=0, sticky="w")
+        self.label(
+            scene_heading,
+            "",
+            color=MUTED,
+            font=("Arial", 8),
+            textvariable=self.scene_count_var
+        ).grid(row=0, column=1, sticky="e")
+
+        scene_controls = tk.Frame(scene_panel, bg=SURFACE)
+        scene_controls.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 9))
+        self.label(scene_controls, "Режим", color=MUTED, font=("Arial", 8, "bold")).pack(side="left", padx=(0, 7))
+        self.mode_combo = ttk.Combobox(
+            scene_controls,
             textvariable=self.mode_var,
             values=["Автоматически", "Вручную"],
             state="readonly",
-            width=20
-        ).pack(side="left", padx=5)
-
-        self.button(
-            mode_frame,
-            "Подготовить сцены",
-            self.prepare_scenes
-        ).pack(side="left", padx=5)
-
-        self.label(
-            self.tab_materials,
-            "Сцены:"
-        ).pack(
-            anchor="w",
-            padx=16,
-            pady=(15, 0)
+            width=12,
+            style="Dark.TCombobox"
         )
+        self.mode_combo.pack(side="left", padx=(0, 8))
+        self.button(
+            scene_controls,
+            "Разбить",
+            self.prepare_scenes,
+            color=SURFACE_2
+        ).pack(side="right")
 
+        scene_list_box = tk.Frame(
+            scene_panel,
+            bg=EDITOR_BG,
+            highlightbackground=BORDER,
+            highlightcolor=BORDER,
+            highlightthickness=1
+        )
+        scene_list_box.grid(row=2, column=0, sticky="nsew", padx=14, pady=(0, 9))
+        scene_list_box.grid_columnconfigure(0, weight=1)
+        scene_list_box.grid_rowconfigure(0, weight=1)
         self.scene_list = tk.Listbox(
-            self.tab_materials,
-            bg=PANEL,
+            scene_list_box,
+            bg=EDITOR_BG,
             fg=WHITE,
             selectbackground=PURPLE,
-            height=7
+            selectforeground=WHITE,
+            activestyle="none",
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            font=("Arial", 9),
+            padx=8,
+            pady=6
         )
-
-        self.scene_list.pack(
-            fill="both",
-            expand=True,
-            padx=15,
-            pady=7
-        )
-
+        scene_scroll = ttk.Scrollbar(scene_list_box, orient="vertical", command=self.scene_list.yview)
+        self.scene_list.configure(yscrollcommand=scene_scroll.set)
+        self.scene_list.grid(row=0, column=0, sticky="nsew")
+        scene_scroll.grid(row=0, column=1, sticky="ns")
+        scene_actions = tk.Frame(scene_panel, bg=SURFACE)
+        scene_actions.grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 13))
         self.button(
-            self.tab_materials,
-            "📌 Назначить материал сцене",
-            self.assign_material
-        ).pack(
-            anchor="w",
-            padx=15,
-            pady=8
-        )
-
-    # ========================================================
-    # МУЗЫКА
-    # ========================================================
+            scene_actions,
+            "Снять",
+            self.clear_scene_material,
+            color=SURFACE_2
+        ).pack(side="left")
+        self.button(
+            scene_actions,
+            "Назначить",
+            self.assign_material,
+            color=PURPLE
+        ).pack(side="right")
 
     def build_music_tab(self):
-        self.label(
-            self.tab_music,
-            "🎵 Музыкальная библиотека"
-        ).pack(
-            anchor="w",
-            padx=20,
-            pady=20
-        )
+        self.tab_music.grid_columnconfigure(0, weight=1)
+        self.tab_music.grid_rowconfigure(1, weight=1)
 
+        library_panel = self.card(self.tab_music)
+        library_panel.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        library_panel.grid_columnconfigure(0, weight=1)
+        self.label(
+            library_panel,
+            "Музыкальная библиотека",
+            color=WHITE,
+            font=("Arial", 12, "bold")
+        ).grid(row=0, column=0, sticky="w", padx=16, pady=(14, 3))
+        self.label(
+            library_panel,
+            "Выберите трек для фона клипа или добавьте собственный MP3.",
+            color=MUTED,
+            font=("Arial", 9)
+        ).grid(row=1, column=0, sticky="w", padx=16, pady=(0, 10))
+
+        library_controls = tk.Frame(library_panel, bg=SURFACE)
+        library_controls.grid(row=2, column=0, sticky="ew", padx=15, pady=(0, 15))
+        library_controls.grid_columnconfigure(0, weight=1)
         self.music_combo = ttk.Combobox(
-            self.tab_music,
+            library_controls,
             textvariable=self.music_var,
             state="readonly",
-            width=65
+            style="Dark.TCombobox"
         )
-
-        self.music_combo.pack(
-            anchor="w",
-            padx=20,
-            pady=10
-        )
-
-        buttons = tk.Frame(self.tab_music, bg=BG)
-
-        buttons.pack(anchor="w", padx=15)
-
+        self.music_combo.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         self.button(
-            buttons,
-            "➕ Добавить MP3",
-            self.add_music
-        ).pack(side="left", padx=5)
-
+            library_controls,
+            "Прослушать",
+            self.preview_music,
+            color=SURFACE_2
+        ).grid(row=0, column=1, padx=4)
         self.button(
-            buttons,
-            "🔄 Обновить",
-            self.refresh_music
-        ).pack(side="left", padx=5)
-
+            library_controls,
+            "+  Добавить MP3",
+            self.add_music,
+            color=CYAN
+        ).grid(row=0, column=2, padx=4)
         self.button(
-            buttons,
-            "📁 Папка music",
-            lambda: os.startfile(str(MUSIC))
-        ).pack(side="left", padx=5)
+            library_controls,
+            "Обновить",
+            self.refresh_music,
+            color=SURFACE_2
+        ).grid(row=0, column=3, padx=4)
+        self.button(
+            library_controls,
+            "Открыть папку",
+            lambda: open_with_default_app(MUSIC),
+            color=SURFACE_2
+        ).grid(row=0, column=4, padx=(4, 0))
 
+        volume_panel = self.card(self.tab_music)
+        volume_panel.grid(row=1, column=0, sticky="nsew")
+        volume_panel.grid_columnconfigure(0, weight=1)
         self.label(
-            self.tab_music,
-            "Громкость фоновой музыки:"
-        ).pack(
-            anchor="w",
-            padx=20,
-            pady=(30, 5)
-        )
+            volume_panel,
+            "Громкость фоновой музыки",
+            color=WHITE,
+            font=("Arial", 12, "bold")
+        ).grid(row=0, column=0, sticky="w", padx=16, pady=(14, 3))
+        self.label(
+            volume_panel,
+            "Рекомендуется 10–15%. Музыка должна быть разрешена для публикации.",
+            color=MUTED,
+            font=("Arial", 9)
+        ).grid(row=1, column=0, sticky="w", padx=16, pady=(0, 16))
 
-        tk.Scale(
-            self.tab_music,
+        volume_row = tk.Frame(volume_panel, bg=SURFACE)
+        volume_row.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 14))
+        volume_row.grid_columnconfigure(0, weight=1)
+        self.volume_scale = tk.Scale(
+            volume_row,
             from_=0,
             to=50,
             variable=self.volume_var,
             orient="horizontal",
             resolution=1,
-            length=400,
-            bg=BG,
+            showvalue=False,
+            command=self.update_volume_display,
+            bg=SURFACE,
             fg=WHITE,
-            troughcolor=PANEL,
-            highlightthickness=0
-        ).pack(anchor="w", padx=20)
-
+            troughcolor="#27374D",
+            activebackground=CYAN,
+            highlightthickness=0,
+            bd=0,
+            sliderrelief="flat",
+            cursor="hand2"
+        )
+        self.volume_scale.grid(row=0, column=0, sticky="ew", padx=(0, 14))
         self.label(
-            self.tab_music,
-            "Рекомендуется 10–15%. "
-            "Используй музыку с разрешением на публикацию."
-        ).pack(
-            anchor="w",
-            padx=20,
-            pady=15
+            volume_row,
+            "",
+            color=CYAN,
+            font=("Arial", 11, "bold"),
+            textvariable=self.volume_label_var
+        ).grid(row=0, column=1, sticky="e")
+        self.update_volume_display(self.volume_var.get())
+
+        folder_hint = self.card(self.tab_music)
+        folder_hint.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        self.label(
+            folder_hint,
+            f"Папка библиотеки: {MUSIC}",
+            color=MUTED,
+            font=("Arial", 8),
+            wraplength=800,
+            justify="left"
+        ).pack(anchor="w", padx=15, pady=12)
+
+    def update_volume_display(self, value):
+        try:
+            self.volume_label_var.set(f"{int(float(value))}%")
+        except (TypeError, ValueError):
+            self.volume_label_var.set(f"{int(self.volume_var.get())}%")
+
+    def build_library_tab(self):
+        self.tab_library.grid_columnconfigure(0, weight=1)
+        self.tab_library.grid_columnconfigure(1, weight=1)
+        self.tab_library.grid_rowconfigure(0, weight=1)
+
+        video_panel = self.card(self.tab_library)
+        video_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
+        video_panel.grid_columnconfigure(0, weight=1)
+        video_panel.grid_rowconfigure(1, weight=1)
+        video_heading = tk.Frame(video_panel, bg=SURFACE)
+        video_heading.grid(row=0, column=0, sticky="ew", padx=15, pady=(14, 8))
+        video_heading.grid_columnconfigure(0, weight=1)
+        self.label(
+            video_heading,
+            "Готовые клипы",
+            color=WHITE,
+            font=("Arial", 12, "bold")
+        ).grid(row=0, column=0, sticky="w")
+        self.label(
+            video_heading,
+            "",
+            color=MUTED,
+            font=("Arial", 8),
+            textvariable=self.library_video_count_var
+        ).grid(row=0, column=1, sticky="e")
+
+        video_box = tk.Frame(
+            video_panel,
+            bg=EDITOR_BG,
+            highlightbackground=BORDER,
+            highlightcolor=BORDER,
+            highlightthickness=1
+        )
+        video_box.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 9))
+        video_box.grid_columnconfigure(0, weight=1)
+        video_box.grid_rowconfigure(0, weight=1)
+        self.library_video_list = tk.Listbox(
+            video_box,
+            bg=EDITOR_BG,
+            fg=WHITE,
+            selectbackground=PURPLE,
+            selectforeground=WHITE,
+            activestyle="none",
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            font=("Arial", 9),
+            padx=8,
+            pady=6
+        )
+        video_scroll = ttk.Scrollbar(video_box, orient="vertical", command=self.library_video_list.yview)
+        self.library_video_list.configure(yscrollcommand=video_scroll.set)
+        self.library_video_list.grid(row=0, column=0, sticky="nsew")
+        video_scroll.grid(row=0, column=1, sticky="ns")
+        self.library_video_list.bind("<Double-Button-1>", lambda _event: self.open_selected_video())
+
+        video_actions = tk.Frame(video_panel, bg=SURFACE)
+        video_actions.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 13))
+        self.button(
+            video_actions,
+            "Открыть клип",
+            self.open_selected_video,
+            color=CYAN
+        ).pack(side="left", padx=(0, 6))
+        self.button(
+            video_actions,
+            "Обновить",
+            self.refresh_library,
+            color=SURFACE_2
+        ).pack(side="left", padx=6)
+        self.button(
+            video_actions,
+            "Папка",
+            self.open_output,
+            color=SURFACE_2
+        ).pack(side="right")
+
+        project_panel = self.card(self.tab_library)
+        project_panel.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
+        project_panel.grid_columnconfigure(0, weight=1)
+        project_panel.grid_rowconfigure(1, weight=1)
+        project_heading = tk.Frame(project_panel, bg=SURFACE)
+        project_heading.grid(row=0, column=0, sticky="ew", padx=15, pady=(14, 8))
+        project_heading.grid_columnconfigure(0, weight=1)
+        self.label(
+            project_heading,
+            "Проекты",
+            color=WHITE,
+            font=("Arial", 12, "bold")
+        ).grid(row=0, column=0, sticky="w")
+        self.label(
+            project_heading,
+            "",
+            color=MUTED,
+            font=("Arial", 8),
+            textvariable=self.library_project_count_var
+        ).grid(row=0, column=1, sticky="e")
+
+        project_box = tk.Frame(
+            project_panel,
+            bg=EDITOR_BG,
+            highlightbackground=BORDER,
+            highlightcolor=BORDER,
+            highlightthickness=1
+        )
+        project_box.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 9))
+        project_box.grid_columnconfigure(0, weight=1)
+        project_box.grid_rowconfigure(0, weight=1)
+        self.library_project_list = tk.Listbox(
+            project_box,
+            bg=EDITOR_BG,
+            fg=WHITE,
+            selectbackground=PURPLE,
+            selectforeground=WHITE,
+            activestyle="none",
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            font=("Arial", 9),
+            padx=8,
+            pady=6
+        )
+        project_scroll = ttk.Scrollbar(project_box, orient="vertical", command=self.library_project_list.yview)
+        self.library_project_list.configure(yscrollcommand=project_scroll.set)
+        self.library_project_list.grid(row=0, column=0, sticky="nsew")
+        project_scroll.grid(row=0, column=1, sticky="ns")
+        self.library_project_list.bind("<Double-Button-1>", lambda _event: self.load_selected_project())
+
+        project_actions = tk.Frame(project_panel, bg=SURFACE)
+        project_actions.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 13))
+        self.button(
+            project_actions,
+            "Открыть",
+            self.load_selected_project,
+            color=PURPLE
+        ).pack(side="left", padx=(0, 6))
+        self.button(
+            project_actions,
+            "Обновить",
+            self.refresh_library,
+            color=SURFACE_2
+        ).pack(side="left", padx=6)
+        self.button(
+            project_actions,
+            "Сохранить",
+            self.save_project,
+            color=SURFACE_2
+        ).pack(side="right")
+
+    def refresh_library(self):
+        if not hasattr(self, "library_video_list"):
+            return
+
+        self.output_video_files = sorted(
+            (
+                path for path in OUTPUT.iterdir()
+                if path.is_file() and path.suffix.lower() == ".mp4"
+            ),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True
+        )
+        self.library_video_list.delete(0, tk.END)
+        for path in self.output_video_files:
+            modified = datetime.fromtimestamp(path.stat().st_mtime).strftime("%d.%m.%Y %H:%M")
+            size_mb = path.stat().st_size / (1024 * 1024)
+            self.library_video_list.insert(
+                tk.END,
+                f"{path.name}  ·  {size_mb:.1f} MB  ·  {modified}"
+            )
+        video_count = len(self.output_video_files)
+        self.library_video_count_var.set(
+            f"{video_count} {russian_plural(video_count, 'клип', 'клипа', 'клипов')}"
         )
 
-    # ========================================================
-    # НАСТРОЙКИ
-    # ========================================================
+        self.project_file_paths = sorted(
+            (
+                path for path in PROJECTS.glob("*.json")
+                if path.is_file() and path.resolve() != AUTOSAVE_PATH.resolve()
+            ),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True
+        )
+        self.library_project_list.delete(0, tk.END)
+        for path in self.project_file_paths:
+            modified = datetime.fromtimestamp(path.stat().st_mtime).strftime("%d.%m.%Y %H:%M")
+            self.library_project_list.insert(
+                tk.END,
+                f"{path.stem}  ·  {modified}"
+            )
+        project_count = len(self.project_file_paths)
+        self.library_project_count_var.set(
+            f"{project_count} {russian_plural(project_count, 'проект', 'проекта', 'проектов')}"
+        )
+
+    def open_selected_video(self):
+        selection = self.library_video_list.curselection()
+        if not selection:
+            messagebox.showinfo("Клипы", "Выберите клип в списке.")
+            return
+        path = self.output_video_files[selection[0]]
+        if not path.exists():
+            self.refresh_library()
+            messagebox.showwarning("Клипы", "Файл больше не найден. Список обновлён.")
+            return
+        open_with_default_app(path)
+
+    def load_selected_project(self):
+        selection = self.library_project_list.curselection()
+        if not selection:
+            messagebox.showinfo("Проекты", "Выберите проект в списке.")
+            return
+        self.load_project(self.project_file_paths[selection[0]])
 
     def build_settings_tab(self):
-        information = (
-            "НЕЙРОХАК СТУДИЯ 4.2\n\n"
-            "Разрешение: 720 × 1280\n"
-            "Частота: 25 FPS\n"
-            "Видеокодек: H.264\n"
-            "Озвучка: Piper\n\n"
-            "Субтитры: белые, с голубыми акцентами\n"
-            "Музыка: MP3\n"
-            "Сценарии: встроенный помощник\n\n"
-            "Помощник работает по шаблонам,\n"
-            "без интернета и платных API."
-        )
+        self.tab_settings.grid_columnconfigure(0, weight=1)
+        self.tab_settings.grid_columnconfigure(1, weight=1)
+        self.tab_settings.grid_rowconfigure(0, weight=1)
 
+        info_panel = self.card(self.tab_settings)
+        info_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
         self.label(
-            self.tab_settings,
-            information
-        ).pack(
-            anchor="w",
-            padx=20,
-            pady=20
+            info_panel,
+            "Параметры проекта",
+            color=WHITE,
+            font=("Arial", 12, "bold")
+        ).pack(anchor="w", padx=16, pady=(15, 10))
+        information = (
+            "Видео: 720 × 1280 px, 25 FPS\n"
+            "Формат: вертикальный 9:16, H.264\n"
+            "Озвучка: Piper · русский язык\n"
+            "Субтитры и фоновая музыка — по настройкам проекта.\n\n"
+            "ИИ-помощник использует встроенные шаблоны и работает без интернета и платных API."
         )
-
+        self.label(
+            info_panel,
+            information,
+            color="#C0CBD9",
+            font=("Arial", 10),
+            justify="left",
+            anchor="nw",
+            wraplength=420
+        ).pack(fill="x", padx=16, pady=(0, 14))
+        tk.Frame(info_panel, bg=BORDER, height=1).pack(fill="x", padx=16, pady=(0, 12))
         self.button(
-            self.tab_settings,
-            "🔍 Проверить компоненты",
-            self.show_components
-        ).pack(anchor="w", padx=20)
+            info_panel,
+            "Открыть папку программы",
+            lambda: open_with_default_app(BASE),
+            color=SURFACE_2
+        ).pack(anchor="w", padx=16, pady=(0, 15))
 
+        diagnostics = self.card(self.tab_settings)
+        diagnostics.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
+        diagnostics.grid_columnconfigure(0, weight=1)
+        self.label(
+            diagnostics,
+            "Состояние компонентов",
+            color=WHITE,
+            font=("Arial", 12, "bold")
+        ).grid(row=0, column=0, sticky="w", padx=16, pady=(15, 4))
+        self.component_status_var = tk.StringVar(value="Проверка ещё не запускалась")
+        self.label(
+            diagnostics,
+            "",
+            color=MUTED,
+            font=("Arial", 9),
+            textvariable=self.component_status_var,
+            wraplength=360,
+            justify="left",
+            anchor="w"
+        ).grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 12))
         self.button(
-            self.tab_settings,
-            "📁 Папка программы",
-            lambda: os.startfile(str(BASE))
-        ).pack(
-            anchor="w",
-            padx=20,
-            pady=10
-        )
+            diagnostics,
+            "Проверить компоненты",
+            self.show_components,
+            color=CYAN
+        ).grid(row=2, column=0, sticky="w", padx=16, pady=(0, 16))
+
+        directories = self.card(self.tab_settings)
+        directories.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        directories.grid_columnconfigure(0, weight=1)
+        self.label(
+            directories,
+            "Папки приложения",
+            color=WHITE,
+            font=("Arial", 10, "bold")
+        ).grid(row=0, column=0, sticky="w", padx=15, pady=(11, 3))
+        self.label(
+            directories,
+            f"Результаты: {OUTPUT}    ·    Проекты: {PROJECTS}    ·    Музыка: {MUSIC}",
+            color=MUTED,
+            font=("Arial", 8),
+            wraplength=850,
+            justify="left"
+        ).grid(row=1, column=0, sticky="w", padx=15, pady=(0, 11))
 
     # ========================================================
     # КОПИРОВАНИЕ И ВСТАВКА
@@ -1833,7 +2879,27 @@ class NeuroHackStudio:
             if file not in self.materials:
                 self.materials.append(file)
 
+        if files:
+            self.refresh_materials()
+            self.is_dirty = True
+            self.schedule_autosave()
+
+    def remove_selected_material(self):
+        selection = self.material_list.curselection()
+        if not selection:
+            messagebox.showinfo("Материалы", "Выберите файл, который нужно убрать.")
+            return
+
+        removed = self.materials.pop(selection[0])
+        self.scene_assignments = {
+            index: path
+            for index, path in self.scene_assignments.items()
+            if str(path) != str(removed)
+        }
         self.refresh_materials()
+        self.refresh_scenes()
+        self.is_dirty = True
+        self.schedule_autosave()
 
     def refresh_materials(self):
         self.material_list.delete(0, tk.END)
@@ -1844,12 +2910,19 @@ class NeuroHackStudio:
                 Path(item).name
             )
 
+        count = len(self.materials)
+        suffix = russian_plural(count, "файл", "файла", "файлов")
+        self.material_count_var.set(f"{count} {suffix}")
+
     def clear_materials(self):
+        if not self.materials and not self.scene_assignments:
+            return
         self.materials.clear()
         self.scene_assignments.clear()
-
         self.refresh_materials()
         self.refresh_scenes()
+        self.is_dirty = True
+        self.schedule_autosave()
 
     # ========================================================
     # СЦЕНЫ
@@ -1861,14 +2934,33 @@ class NeuroHackStudio:
             tk.END
         ).strip()
 
-        self.prepared_scenes = split_script(text)
-        self.scene_assignments.clear()
+        old_scenes = list(self.prepared_scenes)
+        old_assignments = dict(self.scene_assignments)
+        new_scenes = split_script(text)
+        retained_assignments = {}
 
+        for old_start, new_start, size in SequenceMatcher(
+            a=old_scenes,
+            b=new_scenes,
+            autojunk=False
+        ).get_matching_blocks():
+            for offset in range(size):
+                old_index = old_start + offset
+                new_index = new_start + offset
+                if old_index in old_assignments:
+                    retained_assignments[new_index] = old_assignments[old_index]
+
+        self.prepared_scenes = new_scenes
+        self.scene_assignments = retained_assignments
+        self.update_script_details()
         self.refresh_scenes()
+        self.is_dirty = True
+        self.schedule_autosave()
 
         messagebox.showinfo(
             "Сцены",
-            f"Подготовлено сцен: {len(self.prepared_scenes)}"
+            f"Подготовлено сцен: {len(self.prepared_scenes)}. "
+            f"Сохранено назначений: {len(retained_assignments)}."
         )
 
     def refresh_scenes(self):
@@ -1889,6 +2981,23 @@ class NeuroHackStudio:
                 tk.END,
                 f"{index + 1}. {scene[:50]} [{name}]"
             )
+
+        count = len(self.prepared_scenes)
+        suffix = russian_plural(count, "сцена", "сцены", "сцен")
+        self.scene_count_var.set(f"{count} {suffix}")
+
+    def clear_scene_material(self):
+        selected = self.scene_list.curselection()
+        if not selected:
+            messagebox.showinfo("Сцены", "Сначала выберите сцену.")
+            return
+        if self.scene_assignments.pop(selected[0], None) is None:
+            messagebox.showinfo("Сцены", "Для этой сцены материал не назначен.")
+            return
+        self.refresh_scenes()
+        self.scene_list.selection_set(selected[0])
+        self.is_dirty = True
+        self.schedule_autosave()
 
     def assign_material(self):
         selected = self.scene_list.curselection()
@@ -1918,6 +3027,9 @@ class NeuroHackStudio:
 
             self.refresh_materials()
             self.refresh_scenes()
+            self.scene_list.selection_set(selected[0])
+            self.is_dirty = True
+            self.schedule_autosave()
 
     # ========================================================
     # МУЗЫКА
@@ -1955,149 +3067,258 @@ class NeuroHackStudio:
 
         self.refresh_music()
 
+    def preview_music(self):
+        name = self.music_var.get()
+        if name == "Без музыки":
+            messagebox.showinfo("Музыка", "Сначала выберите трек из библиотеки.")
+            return
+        path = MUSIC / name
+        if not path.is_file():
+            self.refresh_music()
+            messagebox.showwarning("Музыка", "Файл не найден. Библиотека обновлена.")
+            return
+        open_with_default_app(path)
+
     # ========================================================
     # СОХРАНЕНИЕ ПРОЕКТА
     # ========================================================
+
+    def collect_project_data(self):
+        return {
+            "version": 2,
+            "script": self.script_text.get("1.0", "end-1c").strip(),
+            "voice": self.voice_var.get(),
+            "speed": self.speed_var.get(),
+            "subtitles": self.subtitle_var.get(),
+            "export_srt": self.export_srt_var.get(),
+            "subtitle_size": self.subtitle_size.get(),
+            "materials": list(self.materials),
+            "mode": self.mode_var.get(),
+            "assignments": {str(key): value for key, value in self.scene_assignments.items()},
+            "music": self.music_var.get(),
+            "volume": float(self.volume_var.get()),
+            "project_file": str(self.current_project_file) if self.current_project_file else ""
+        }
+
+    @staticmethod
+    def write_project_file(path, data):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        with open(temporary, "w", encoding="utf-8") as output:
+            json.dump(data, output, ensure_ascii=False, indent=2)
+        temporary.replace(path)
 
     def save_project(self):
         file = filedialog.asksaveasfilename(
             initialdir=PROJECTS,
             defaultextension=".json",
-            filetypes=[
-                ("Проект НЕЙРОХАК", "*.json")
-            ]
+            filetypes=[("Проект НЕЙРОХАК", "*.json")]
         )
-
-        if not file:
-            return
-
-        data = {
-            "script": self.script_text.get(
-                "1.0",
-                tk.END
-            ).strip(),
-
-            "voice": self.voice_var.get(),
-            "speed": self.speed_var.get(),
-
-            "subtitles": self.subtitle_var.get(),
-            "subtitle_size": self.subtitle_size.get(),
-
-            "materials": self.materials,
-            "mode": self.mode_var.get(),
-
-            "assignments": self.scene_assignments,
-
-            "music": self.music_var.get(),
-            "volume": self.volume_var.get()
-        }
-
-        with open(
-            file,
-            "w",
-            encoding="utf-8"
-        ) as output:
-            json.dump(
-                data,
-                output,
-                ensure_ascii=False,
-                indent=2
-            )
-
-        messagebox.showinfo(
-            "Проект",
-            "Проект сохранён."
-        )
-
-    # ========================================================
-    # ОТКРЫТИЕ ПРОЕКТА
-    # ========================================================
-
-    def load_project(self):
-        file = filedialog.askopenfilename(
-            initialdir=PROJECTS,
-            filetypes=[
-                ("Проект НЕЙРОХАК", "*.json")
-            ]
-        )
-
         if not file:
             return
 
         try:
-            with open(
-                file,
-                "r",
-                encoding="utf-8"
-            ) as source:
-                data = json.load(source)
+            self.current_project_file = Path(file).resolve()
+            self.write_project_file(self.current_project_file, self.collect_project_data())
+            self.is_dirty = False
+            if self._autosave_after is not None:
+                try:
+                    self.root.after_cancel(self._autosave_after)
+                except Exception:
+                    pass
+                self._autosave_after = None
+            try:
+                AUTOSAVE_PATH.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self.refresh_library()
+            self.status_var.set(f"Проект сохранён: {self.current_project_file.name}")
+            messagebox.showinfo("Проект", "Проект сохранён.")
+        except Exception as error:
+            write_error(error)
+            messagebox.showerror("Ошибка сохранения", str(error))
 
+    def apply_project_data(self, data):
+        if not isinstance(data, dict):
+            raise ValueError("Файл проекта имеет неверный формат.")
+
+        self._loading_project = True
+        try:
+            script = data.get("script", "")
+            script = script if isinstance(script, str) else str(script)
             self.script_text.delete("1.0", tk.END)
+            self.script_text.insert("1.0", script)
+            self.script_text.edit_modified(False)
 
-            self.script_text.insert(
-                "1.0",
-                data.get("script", "")
-            )
-
+            voice = data.get("voice", "Мужской")
             self.voice_var.set(
-                data.get("voice", "Мужской")
+                voice if isinstance(voice, str) and voice in VOICE_MODELS else "Мужской"
             )
-
+            speed = data.get("speed", "Нормальная")
             self.speed_var.set(
-                data.get("speed", "Нормальная")
+                speed if isinstance(speed, str) and speed in VOICE_SPEEDS else "Нормальная"
             )
-
-            self.subtitle_var.set(
-                data.get("subtitles", True)
-            )
-
+            self.subtitle_var.set(bool(data.get("subtitles", True)))
+            self.export_srt_var.set(bool(data.get("export_srt", True)))
+            subtitle_size = data.get("subtitle_size", "Средние")
             self.subtitle_size.set(
-                data.get("subtitle_size", "Средние")
+                subtitle_size
+                if isinstance(subtitle_size, str) and subtitle_size in SUBTITLE_SIZES
+                else "Средние"
             )
-
-            self.materials = data.get("materials", [])
-
+            mode = data.get("mode", "Автоматически")
             self.mode_var.set(
-                data.get("mode", "Автоматически")
+                mode if mode in ("Автоматически", "Вручную") else "Автоматически"
             )
 
-            self.volume_var.set(
-                data.get("volume", 12)
-            )
+            materials = data.get("materials", [])
+            if not isinstance(materials, list):
+                materials = []
+            self.materials = [str(item) for item in materials if isinstance(item, (str, Path))]
+            self.prepared_scenes = split_script(script)
+            assignments = data.get("assignments", {})
+            self.scene_assignments = {}
+            if isinstance(assignments, dict):
+                for key, value in assignments.items():
+                    try:
+                        index = int(key)
+                    except (TypeError, ValueError):
+                        continue
+                    if 0 <= index < len(self.prepared_scenes) and isinstance(value, str):
+                        self.scene_assignments[index] = value
+
+            try:
+                volume = float(data.get("volume", 12))
+                self.volume_var.set(max(0, min(50, volume)))
+            except (TypeError, ValueError):
+                self.volume_var.set(12)
 
             self.refresh_music()
-
             music = data.get("music", "Без музыки")
-
-            if music in self.music_combo["values"]:
-                self.music_var.set(music)
-
-            self.prepared_scenes = split_script(
-                data.get("script", "")
+            self.music_var.set(
+                music
+                if isinstance(music, str) and music in self.music_combo["values"]
+                else "Без музыки"
             )
-
-            self.scene_assignments = {
-                int(key): value
-                for key, value in data.get(
-                    "assignments", {}
-                ).items()
-            }
-
             self.refresh_materials()
             self.refresh_scenes()
-
-            messagebox.showinfo(
-                "Проект",
-                "Проект открыт."
+            self.update_script_details()
+            self.preview_info_var.set(
+                "Субтитры включены" if self.subtitle_var.get() else "Субтитры выключены"
             )
+            self.schedule_preview()
+            self.update_volume_display(self.volume_var.get())
+        finally:
+            self._loading_project = False
 
+    def load_project(self, path=None, show_message=True):
+        if path is None:
+            path = filedialog.askopenfilename(
+                initialdir=PROJECTS,
+                filetypes=[("Проект НЕЙРОХАК", "*.json")]
+            )
+        if not path:
+            return
+
+        path = Path(path)
+        try:
+            with open(path, "r", encoding="utf-8") as source:
+                data = json.load(source)
+            self.apply_project_data(data)
+            self.current_project_file = path.resolve()
+            self.is_dirty = False
+            if self._autosave_after is not None:
+                try:
+                    self.root.after_cancel(self._autosave_after)
+                except Exception:
+                    pass
+                self._autosave_after = None
+            try:
+                AUTOSAVE_PATH.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self.refresh_library()
+            self.status_var.set(f"Проект открыт: {path.name}")
+            if show_message:
+                messagebox.showinfo("Проект", "Проект открыт.")
+        except Exception as error:
+            write_error(error)
+            messagebox.showerror("Ошибка открытия проекта", str(error))
+
+    def on_project_setting_changed(self, *_args):
+        if self._loading_project:
+            return
+        self.is_dirty = True
+        self.schedule_autosave()
+
+    def schedule_autosave(self):
+        if self._loading_project or not self.is_dirty:
+            return
+        if self._autosave_after is not None:
+            try:
+                self.root.after_cancel(self._autosave_after)
+            except Exception:
+                pass
+        self._autosave_after = self.root.after(1200, self.write_autosave)
+
+    def write_autosave(self):
+        self._autosave_after = None
+        if self._loading_project or not self.is_dirty:
+            return
+        try:
+            self.write_project_file(AUTOSAVE_PATH, self.collect_project_data())
         except Exception as error:
             write_error(error)
 
-            messagebox.showerror(
-                "Ошибка",
-                str(error)
+    def restore_autosave(self):
+        if not AUTOSAVE_PATH.exists():
+            return
+        try:
+            with open(AUTOSAVE_PATH, "r", encoding="utf-8") as source:
+                data = json.load(source)
+        except Exception as error:
+            write_error(error)
+            return
+
+        if not messagebox.askyesno(
+            "Восстановить работу?",
+            "Найдена автокопия последней сессии. Восстановить сценарий и настройки?"
+        ):
+            try:
+                AUTOSAVE_PATH.unlink()
+            except OSError:
+                pass
+            return
+
+        try:
+            self.apply_project_data(data)
+            source_project = data.get("project_file")
+            self.current_project_file = (
+                Path(source_project)
+                if isinstance(source_project, str) and source_project
+                else None
             )
+            self.is_dirty = True
+            self.status_var.set("Последняя сессия восстановлена")
+        except Exception as error:
+            write_error(error)
+            messagebox.showerror("Автосохранение", str(error))
+
+    def on_close(self):
+        if self.busy:
+            if not messagebox.askyesno(
+                "Задача выполняется",
+                "Остановить текущую задачу и закрыть программу?"
+            ):
+                return
+            self._close_when_idle = True
+            self.cancel_creation()
+            return
+
+        if self.is_dirty:
+            self.write_autosave()
+        self.root.destroy()
 
     # ========================================================
     # ПРОВЕРКА ГОЛОСА
@@ -2120,10 +3341,14 @@ class NeuroHackStudio:
         speed = self.speed_var.get()
 
         self.busy = True
-
-        self.status_var.set(
-            "Проверка озвучки..."
+        self.cancel_event.clear()
+        self.set_progress(0)
+        self.create_button.configure(
+            state="disabled",
+            text="Проверяем голос…"
         )
+        self.cancel_button.configure(state="normal")
+        self.status_var.set("Проверка озвучки...")
 
         def worker():
             try:
@@ -2134,17 +3359,19 @@ class NeuroHackStudio:
                     "Проверяем качество русской озвучки.",
                     voice,
                     speed,
-                    file
+                    file,
+                    cancel_event=self.cancel_event
                 )
 
                 self.root.after(
                     0,
-                    lambda: os.startfile(str(file))
+                    lambda: open_with_default_app(file)
                 )
 
-                self.update_status(
-                    "Проверка голоса завершена"
-                )
+                self.update_progress(100, "Проверка голоса завершена")
+
+            except TaskCancelled:
+                self.update_status("Проверка голоса отменена")
 
             except Exception as error:
                 write_error(error)
@@ -2214,35 +3441,59 @@ class NeuroHackStudio:
                 )
                 return
 
+        valid_materials = [
+            str(path) for path in self.materials
+            if Path(path).is_file()
+        ]
+        valid_assignments = {
+            int(index): str(path)
+            for index, path in self.scene_assignments.items()
+            if Path(path).is_file()
+        }
+        referenced = set(map(str, self.materials)) | set(
+            str(path) for path in self.scene_assignments.values()
+        )
+        missing_materials = sorted(
+            path for path in referenced if not Path(path).is_file()
+        )
+        if missing_materials:
+            preview = "\n".join(Path(path).name for path in missing_materials[:5])
+            if not messagebox.askyesno(
+                "Материалы не найдены",
+                f"Не удалось найти файлов: {len(missing_materials)}.\n{preview}\n\n"
+                "Продолжить без недоступных материалов?"
+            ):
+                return
+            self.materials = valid_materials
+            self.scene_assignments = valid_assignments
+            self.refresh_materials()
+            self.refresh_scenes()
+            self.is_dirty = True
+            self.schedule_autosave()
+
         settings = {
             "scenes": scenes,
-
             "voice": self.voice_var.get(),
             "speed": self.speed_var.get(),
-
             "subtitles": self.subtitle_var.get(),
+            "export_srt": self.export_srt_var.get(),
             "subtitle_size": self.subtitle_size.get(),
-
-            "materials": list(self.materials),
+            "materials": valid_materials,
             "mode": self.mode_var.get(),
-
-            "assignments": dict(
-                self.scene_assignments
-            ),
-
+            "assignments": valid_assignments,
             "music": self.music_var.get(),
             "volume": self.volume_var.get()
         }
 
         self.busy = True
-
+        self.cancel_event.clear()
+        self.set_progress(0)
         self.create_button.configure(
-            state="disabled"
+            state="disabled",
+            text="СОБИРАЕМ КЛИП…"
         )
-
-        self.update_status(
-            "Начинаем создание клипа..."
-        )
+        self.cancel_button.configure(state="normal")
+        self.update_status("Подготовка к созданию клипа...")
 
         threading.Thread(
             target=self.process_video,
@@ -2252,11 +3503,31 @@ class NeuroHackStudio:
 
     # --------------------------------------------------------
 
+    def set_progress(self, value):
+        value = max(0.0, min(100.0, float(value)))
+        self.progress_var.set(value)
+        self.progress_percent_var.set(f"{round(value)}%")
+
+    def cancel_creation(self):
+        if not self.busy or self.cancel_event.is_set():
+            return
+        self.cancel_event.set()
+        self.cancel_button.configure(state="disabled")
+        self.status_var.set("Останавливаем задачу… дождитесь завершения текущего этапа.")
+
     def update_status(self, text):
         self.root.after(
             0,
             lambda text=text: self.status_var.set(text)
         )
+
+    def update_progress(self, value, text=None):
+        def apply_update():
+            self.set_progress(value)
+            if text is not None:
+                self.status_var.set(text)
+
+        self.root.after(0, apply_update)
 
     # --------------------------------------------------------
 
@@ -2270,19 +3541,26 @@ class NeuroHackStudio:
                 f"NEUROHACK_42_{timestamp}.mp4"
             )
 
+            self.last_srt = None
             with tempfile.TemporaryDirectory(
                 prefix="neurohack42_"
             ) as temp:
                 workdir = Path(temp)
 
                 scene_files = []
+                captions = []
+                timeline = 0.0
                 scenes = settings["scenes"]
+                scene_total = max(1, len(scenes))
 
                 for index, text in enumerate(scenes):
+                    if self.cancel_event.is_set():
+                        raise TaskCancelled("Задача отменена пользователем.")
                     number = index + 1
 
-                    self.update_status(
-                        f"Сцена {number}/{len(scenes)}: озвучка"
+                    self.update_progress(
+                        index / scene_total * 78,
+                        f"Сцена {number}/{len(scenes)} · генерируем озвучку"
                     )
 
                     voice_file = workdir / (
@@ -2293,7 +3571,12 @@ class NeuroHackStudio:
                         text,
                         settings["voice"],
                         settings["speed"],
-                        voice_file
+                        voice_file,
+                        cancel_event=self.cancel_event
+                    )
+                    self.update_progress(
+                        (index + 0.42) / scene_total * 78,
+                        f"Сцена {number}/{len(scenes)} · готовим графику и субтитры"
                     )
 
                     overlay_file = workdir / (
@@ -2306,27 +3589,31 @@ class NeuroHackStudio:
                     )
 
                     subtitle_files = []
+                    phrases = split_subtitles(text)
+
+                    if settings.get("export_srt", True) and phrases:
+                        speech_duration = audio_duration(voice_file)
+                        phrase_duration = speech_duration / len(phrases)
+                        for phrase_index, phrase in enumerate(phrases):
+                            start = timeline + phrase_index * phrase_duration
+                            end = timeline + (phrase_index + 1) * phrase_duration
+                            captions.append((start, end, phrase))
+                        timeline += speech_duration + 0.20
 
                     if settings["subtitles"]:
-                        phrases = split_subtitles(text)
-
-                        for phrase_index, phrase in enumerate(
-                            phrases
-                        ):
+                        for phrase_index, phrase in enumerate(phrases):
+                            if self.cancel_event.is_set():
+                                raise TaskCancelled("Задача отменена пользователем.")
                             subtitle_file = workdir / (
                                 f"sub_{number:03d}_"
                                 f"{phrase_index:03d}.png"
                             )
-
                             create_subtitle_image(
                                 phrase,
                                 subtitle_file,
                                 settings["subtitle_size"]
                             )
-
-                            subtitle_files.append(
-                                subtitle_file
-                            )
+                            subtitle_files.append(subtitle_file)
 
                     material = None
 
@@ -2348,8 +3635,9 @@ class NeuroHackStudio:
                         f"scene_{number:03d}.mp4"
                     )
 
-                    self.update_status(
-                        f"Сцена {number}/{len(scenes)}: видео"
+                    self.update_progress(
+                        (index + 0.5) / scene_total * 78,
+                        f"Сцена {number}/{len(scenes)} · собираем видео"
                     )
 
                     make_scene(
@@ -2358,21 +3646,25 @@ class NeuroHackStudio:
                         scene_file,
                         overlay_file,
                         subtitle_files,
-                        settings["subtitles"]
+                        settings["subtitles"],
+                        cancel_event=self.cancel_event
                     )
 
                     scene_files.append(scene_file)
+                    self.update_progress(
+                        (index + 1) / scene_total * 78,
+                        f"Сцена {number}/{len(scenes)} готова"
+                    )
 
-                self.update_status(
-                    "Объединение сцен..."
-                )
+                self.update_progress(82, "Объединяем сцены...")
 
                 combined_file = workdir / "combined.mp4"
 
                 combine_scenes(
                     scene_files,
                     combined_file,
-                    workdir
+                    workdir,
+                    cancel_event=self.cancel_event
                 )
 
                 music_file = None
@@ -2384,33 +3676,54 @@ class NeuroHackStudio:
                     if candidate.exists():
                         music_file = candidate
 
-                self.update_status(
-                    "Добавление музыки..."
-                )
+                self.update_progress(92, "Добавляем фоновую музыку...")
 
                 add_background_music(
                     combined_file,
                     music_file,
                     settings["volume"] / 100,
-                    final_file
+                    final_file,
+                    cancel_event=self.cancel_event
                 )
 
+                if self.cancel_event.is_set():
+                    raise TaskCancelled("Задача отменена пользователем.")
+                if settings.get("export_srt", True) and captions:
+                    srt_file = final_file.with_suffix(".srt")
+                    write_srt(srt_file, captions)
+                    self.last_srt = srt_file
+
+                if self.cancel_event.is_set():
+                    raise TaskCancelled("Задача отменена пользователем.")
                 self.last_video = final_file
+                self.update_progress(100, "Финальные штрихи...")
 
-            self.update_status(
-                "✅ Клип готов: " + final_file.name
-            )
-
+            self.update_status("✅ Клип готов: " + final_file.name)
+            self.root.after(0, self.refresh_library)
+            completion_message = "VK-клип создан!\n\n" + str(final_file)
+            if self.last_srt and self.last_srt.exists():
+                completion_message += "\n\nСубтитры: " + str(self.last_srt)
             self.root.after(
                 0,
-                lambda: messagebox.showinfo(
-                    "Готово!",
-                    "VK Клип создан!\n\n"
-                    + str(final_file)
-                )
+                lambda text=completion_message: messagebox.showinfo("Готово!", text)
             )
 
+        except TaskCancelled:
+            for partial in (locals().get("final_file"), locals().get("srt_file")):
+                if partial and Path(partial).exists():
+                    try:
+                        Path(partial).unlink()
+                    except OSError:
+                        pass
+            self.update_status("⏹ Создание клипа отменено")
+
         except Exception as error:
+            for partial in (locals().get("final_file"), locals().get("srt_file")):
+                if partial and Path(partial).exists():
+                    try:
+                        Path(partial).unlink()
+                    except OSError:
+                        pass
             write_error(error)
             text = str(error)
 
@@ -2439,10 +3752,17 @@ class NeuroHackStudio:
 
     def finish_task(self):
         self.busy = False
-
         self.create_button.configure(
-            state="normal"
+            state="normal",
+            text="✦  СОЗДАТЬ КЛИП"
         )
+        self.cancel_button.configure(state="disabled")
+        self.cancel_event.clear()
+        if self._close_when_idle:
+            self._close_when_idle = False
+            if self.is_dirty:
+                self.write_autosave()
+            self.root.destroy()
 
     # ========================================================
     # ПРОСМОТР
@@ -2450,17 +3770,20 @@ class NeuroHackStudio:
 
     def preview_video(self):
         if self.last_video and self.last_video.exists():
-            os.startfile(str(self.last_video))
+            open_with_default_app(self.last_video)
             return
 
         videos = sorted(
-            OUTPUT.glob("*.mp4"),
+            (
+                path for path in OUTPUT.iterdir()
+                if path.is_file() and path.suffix.lower() == ".mp4"
+            ),
             key=lambda file: file.stat().st_mtime,
             reverse=True
         )
 
         if videos:
-            os.startfile(str(videos[0]))
+            open_with_default_app(videos[0])
         else:
             messagebox.showinfo(
                 "Просмотр",
@@ -2468,7 +3791,7 @@ class NeuroHackStudio:
             )
 
     def open_output(self):
-        os.startfile(str(OUTPUT))
+        open_with_default_app(OUTPUT)
 
     # ========================================================
     # ПРОВЕРКА КОМПОНЕНТОВ
@@ -2478,11 +3801,15 @@ class NeuroHackStudio:
         problems = check_components()
 
         if problems:
+            self.component_status_var.set(
+                f"Нужно исправить: {len(problems)} пунктов."
+            )
             messagebox.showwarning(
                 "Компоненты",
                 "\n".join(problems)
             )
         else:
+            self.component_status_var.set("Все компоненты найдены и готовы к работе.")
             messagebox.showinfo(
                 "Компоненты",
                 "✅ FFmpeg найден\n"

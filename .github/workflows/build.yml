@@ -1,10 +1,11 @@
-name: Build NeuroHack Studio 2.0
+name: Build NeuroHack Studio 4.2
 
 on:
   workflow_dispatch:
   push:
     branches:
       - main
+      - 'arena/**'
 
 jobs:
   build:
@@ -88,5 +89,7 @@ jobs:
       - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:
-          name: NeuroHackStudio-2.0
+          name: NeuroHackStudio-4.2
           path: dist/NeuroHackStudio/
+          if-no-files-found: error
+          retention-days: 90
